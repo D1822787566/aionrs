@@ -5,6 +5,15 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn description_uses_windows_powershell_compatible_chaining_guidance() {
+        let tool = ExecCommandTool::new(std::env::temp_dir());
+        let description = tool.description();
+
+        assert!(description.contains("use `; if ($?) { ... }` instead of `&&`"));
+        assert!(!description.contains("Use `&&` only"));
+    }
+
     #[tokio::test]
     async fn execute_echo_returns_stdout() {
         let tool = ExecCommandTool::new(std::env::temp_dir());
