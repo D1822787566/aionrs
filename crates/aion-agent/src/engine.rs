@@ -8,7 +8,7 @@ use crate::commands::{CommandContext, CommandRegistry, CommandResult, CommandSpe
 use crate::compact::auto::{CompactError, autocompact, should_autocompact};
 use crate::compact::emergency::is_at_emergency_limit;
 use crate::compact::estimate::{estimate_tokens_from_tool_image, estimate_tokens_from_tool_result};
-use crate::compact::micro::{microcompact, should_microcompact};
+use crate::compact::micro::{microcompact, should_microcompact, snapshot_live_tool_results};
 use crate::compact::state::CompactState;
 use crate::confirm::ToolConfirmer;
 use crate::context_usage::{
@@ -22,7 +22,7 @@ use crate::orchestration::{
 use crate::output::OutputSink;
 use crate::plan::prompt::plan_mode_instructions;
 use crate::plan::state::PlanState;
-use crate::session::{Session, SessionManager};
+use crate::session::{CompactionAuditKind, CompactionAuditRecord, Session, SessionManager};
 use crate::stream::StreamOutcome;
 use crate::tool_call::{
     DEFAULT_MAX_TOOL_CALL_FAILURE, DEFAULT_MAX_TOOL_CALL_MALFORMED, ToolCallFailureFingerprint,
@@ -1146,15 +1146,34 @@ impl AgentEngine {
     async fn run_compaction(&mut self) -> Result<(), AgentError> {
         // 1. Microcompact (lightweight, no LLM call)
         if self.compact_config.microcompact_enabled && should_microcompact(&self.messages, &self.compact_config) {
-            let result = microcompact(&mut self.messages, &self.compact_config);
+            // Compact a candidate first. The candidate only replaces live
+            // history after its original tool outputs are safely persisted.
+            let mut compacted_messages = self.messages.clone();
+            let result = microcompact(&mut compacted_messages, &self.compact_config);
             if result.cleared_count > 0 {
-                self.output.emit_info(&format!(
-                    "Microcompact: cleared {} tool results (~{} tokens freed)",
-                    result.cleared_count, result.estimated_tokens_freed
-                ));
-                self.context_state.record_microcompact();
-                self.sync_compact_watermark();
-                self.save_session();
+                let audit = CompactionAuditRecord {
+                    kind: CompactionAuditKind::Microcompact,
+                    created_at: Utc::now(),
+                    tool_results: result.cleared_tool_results.clone(),
+                    affected_tool_results: result.cleared_count,
+                    estimated_tokens_freed: Some(result.estimated_tokens_freed),
+                    summarized_messages: None,
+                    pre_compact_tokens: None,
+                };
+                if let Err(error) = self.persist_compaction_audit(audit) {
+                    // Compaction is optional. Never stop the agent run or drop
+                    // raw tool output when its audit cannot be written.
+                    warn!(error = %error, "microcompact skipped because its audit could not be persisted");
+                } else {
+                    self.messages = compacted_messages;
+                    self.output.emit_info(&format!(
+                        "Microcompact: cleared {} tool results (~{} tokens freed)",
+                        result.cleared_count, result.estimated_tokens_freed
+                    ));
+                    self.context_state.record_microcompact();
+                    self.sync_compact_watermark();
+                    self.save_session();
+                }
             }
         }
 
@@ -1192,15 +1211,29 @@ impl AgentEngine {
             .await
             {
                 Ok(result) => {
-                    self.output.emit_info(&format!(
-                        "Autocompact: summarized {} messages ({} tokens → compact)",
-                        result.messages_summarized, result.pre_compact_tokens
-                    ));
-                    self.messages = result.messages;
-                    self.context_state.record_compact();
-                    self.refresh_local_context_estimate();
-                    self.save_session();
-                    compacted = true;
+                    let tool_results = snapshot_live_tool_results(&self.messages);
+                    let audit = CompactionAuditRecord {
+                        kind: CompactionAuditKind::Autocompact,
+                        created_at: Utc::now(),
+                        affected_tool_results: tool_results.len(),
+                        tool_results,
+                        estimated_tokens_freed: None,
+                        summarized_messages: Some(result.messages_summarized),
+                        pre_compact_tokens: Some(result.pre_compact_tokens),
+                    };
+                    if let Err(error) = self.persist_compaction_audit(audit) {
+                        warn!(error = %error, "autocompact skipped because its audit could not be persisted");
+                    } else {
+                        self.output.emit_info(&format!(
+                            "Autocompact: summarized {} messages ({} tokens → compact)",
+                            result.messages_summarized, result.pre_compact_tokens
+                        ));
+                        self.messages = result.messages;
+                        self.context_state.record_compact();
+                        self.refresh_local_context_estimate();
+                        self.save_session();
+                        compacted = true;
+                    }
                 }
                 Err(CompactError::CircuitBroken { .. }) => {
                     // Already tripped; logged at circuit-breaker level
@@ -1573,6 +1606,30 @@ impl AgentEngine {
         if request_shape_changed {
             self.refresh_local_context_estimate();
         }
+    }
+
+    fn persist_compaction_audit(&mut self, audit: CompactionAuditRecord) -> AnyhowResult<()> {
+        let manager = self
+            .session_manager
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("session persistence is disabled"))?;
+        let mut session = self
+            .current_session
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("session is not initialized"))?
+            .clone();
+
+        session.compaction_audit.push(audit);
+        session.messages = self.messages.clone();
+        session.total_usage = self.total_usage.clone();
+        session.context_state = self.context_state.clone();
+        session.updated_at = Utc::now();
+        manager.save(&session)?;
+        *self
+            .current_session
+            .as_mut()
+            .expect("current session was checked above") = session;
+        Ok(())
     }
 
     fn save_session(&mut self) {

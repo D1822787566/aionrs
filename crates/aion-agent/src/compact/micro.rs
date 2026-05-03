@@ -9,17 +9,22 @@ use std::collections::{HashMap, HashSet};
 use aion_config::compact::CompactConfig;
 use aion_types::message::{ContentBlock, Message, Role};
 use chrono::Utc;
+use serde_json::Value;
+
+use crate::session::ToolExecutionAuditRecord;
 
 /// Placeholder that replaces cleared tool result content.
 pub const CLEARED_TOOL_RESULT: &str = "[Tool result cleared]";
 
 /// Statistics returned after a microcompact pass.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MicrocompactResult {
     /// Number of tool results whose content was cleared.
     pub cleared_count: usize,
     /// Rough estimate of tokens freed (content bytes / 4).
     pub estimated_tokens_freed: usize,
+    /// Original tool executions captured before their results were cleared.
+    pub cleared_tool_results: Vec<ToolExecutionAuditRecord>,
 }
 
 // ── Trigger checks ──────────────────────────────────────────────────────────
@@ -73,6 +78,7 @@ fn count_trigger(messages: &[Message], config: &CompactConfig) -> bool {
 /// the keep budget.
 pub fn microcompact(messages: &mut [Message], config: &CompactConfig) -> MicrocompactResult {
     let tool_names = build_tool_name_map(messages);
+    let tool_inputs = build_tool_input_map(messages);
     let compactable_set: HashSet<&str> = config.compactable_tools.iter().map(String::as_str).collect();
 
     // Collect (message_index, block_index) of all compactable, non-cleared
@@ -84,6 +90,7 @@ pub fn microcompact(messages: &mut [Message], config: &CompactConfig) -> Microco
         return MicrocompactResult {
             cleared_count: 0,
             estimated_tokens_freed: 0,
+            cleared_tool_results: Vec::new(),
         };
     }
 
@@ -91,11 +98,31 @@ pub fn microcompact(messages: &mut [Message], config: &CompactConfig) -> Microco
 
     let mut cleared_count = 0usize;
     let mut tokens_freed = 0usize;
+    let mut cleared_tool_results = Vec::with_capacity(to_clear.len());
 
     for &(mi, bi) in to_clear {
-        if let ContentBlock::ToolResult { content, .. } = &mut messages[mi].content[bi] {
+        let message = &mut messages[mi];
+        let message_timestamp = message.timestamp;
+        let turn_id = message.turn_id.clone();
+        if let ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } = &mut message.content[bi]
+        {
             // Rough token estimate: ~4 chars per token.
             tokens_freed += content.len() / 4;
+            if let Some(tool_name) = tool_names.get(tool_use_id) {
+                cleared_tool_results.push(ToolExecutionAuditRecord {
+                    tool_use_id: tool_use_id.clone(),
+                    tool_name: tool_name.clone(),
+                    input: tool_inputs.get(tool_use_id).cloned().unwrap_or(Value::Null),
+                    output: content.clone(),
+                    is_error: *is_error,
+                    message_timestamp,
+                    turn_id,
+                });
+            }
             *content = CLEARED_TOOL_RESULT.to_string();
             cleared_count += 1;
         }
@@ -104,6 +131,7 @@ pub fn microcompact(messages: &mut [Message], config: &CompactConfig) -> Microco
     MicrocompactResult {
         cleared_count,
         estimated_tokens_freed: tokens_freed,
+        cleared_tool_results,
     }
 }
 
@@ -121,6 +149,50 @@ fn build_tool_name_map(messages: &[Message]) -> HashMap<String, String> {
         }
     }
     map
+}
+
+fn build_tool_input_map(messages: &[Message]) -> HashMap<String, Value> {
+    let mut map = HashMap::new();
+    for msg in messages {
+        for block in &msg.content {
+            if let ContentBlock::ToolUse { id, input, .. } = block {
+                map.insert(id.clone(), input.clone());
+            }
+        }
+    }
+    map
+}
+
+/// Capture every live tool result that autocompact would remove.
+pub(crate) fn snapshot_live_tool_results(messages: &[Message]) -> Vec<ToolExecutionAuditRecord> {
+    let tool_names = build_tool_name_map(messages);
+    let tool_inputs = build_tool_input_map(messages);
+    let mut records = Vec::new();
+
+    for message in messages {
+        for block in &message.content {
+            if let ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } = block
+                && content != CLEARED_TOOL_RESULT
+                && let Some(tool_name) = tool_names.get(tool_use_id)
+            {
+                records.push(ToolExecutionAuditRecord {
+                    tool_use_id: tool_use_id.clone(),
+                    tool_name: tool_name.clone(),
+                    input: tool_inputs.get(tool_use_id).cloned().unwrap_or(Value::Null),
+                    output: content.clone(),
+                    is_error: *is_error,
+                    message_timestamp: message.timestamp,
+                    turn_id: message.turn_id.clone(),
+                });
+            }
+        }
+    }
+
+    records
 }
 
 /// Count compactable, non-cleared tool results.

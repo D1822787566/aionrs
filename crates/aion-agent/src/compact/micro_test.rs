@@ -9,10 +9,14 @@ mod tests {
     // ── Test helpers ────────────────────────────────────────────────────
 
     fn tool_use_block(id: &str, name: &str) -> ContentBlock {
+        tool_use_block_with_input(id, name, json!({}))
+    }
+
+    fn tool_use_block_with_input(id: &str, name: &str, input: serde_json::Value) -> ContentBlock {
         ContentBlock::ToolUse {
             id: id.to_string(),
             name: name.to_string(),
-            input: json!({}),
+            input,
             extra: None,
         }
     }
@@ -232,6 +236,37 @@ mod tests {
             };
             assert_eq!(content, expected);
         }
+    }
+
+    #[test]
+    fn captures_original_tool_data_before_result_is_cleared() {
+        let mut msgs = vec![
+            assistant_msg(vec![tool_use_block_with_input(
+                "t1",
+                "Read",
+                json!({ "path": "first.md" }),
+            )]),
+            user_msg(vec![tool_result_block("t1", "first result")]),
+            assistant_msg(vec![tool_use_block("t2", "Read")]),
+            user_msg(vec![tool_result_block("t2", "second result")]),
+        ];
+        let config = CompactConfig {
+            micro_keep_recent: 1,
+            ..default_config()
+        };
+
+        let result = microcompact(&mut msgs, &config);
+
+        assert_eq!(result.cleared_tool_results.len(), 1);
+        let audit = &result.cleared_tool_results[0];
+        assert_eq!(audit.tool_use_id, "t1");
+        assert_eq!(audit.tool_name, "Read");
+        assert_eq!(audit.input, json!({ "path": "first.md" }));
+        assert_eq!(audit.output, "first result");
+        assert!(matches!(
+            &msgs[1].content[0],
+            ContentBlock::ToolResult { content, .. } if content == CLEARED_TOOL_RESULT
+        ));
     }
 
     #[test]

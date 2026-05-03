@@ -51,15 +51,51 @@ mod tests {
     }
 
     #[test]
+    fn compaction_audit_survives_save_and_load() {
+        let dir = tempdir().unwrap();
+        let manager = SessionManager::new(dir.path().to_path_buf(), 10);
+        let mut session = manager
+            .create("anthropic", "claude-3", "/home", Some("audit-session"))
+            .unwrap();
+        session.compaction_audit.push(CompactionAuditRecord {
+            kind: CompactionAuditKind::Microcompact,
+            created_at: Utc::now(),
+            tool_results: vec![ToolExecutionAuditRecord {
+                tool_use_id: "tool-1".into(),
+                tool_name: "Read".into(),
+                input: serde_json::json!({ "path": "notes.md" }),
+                output: "original result".into(),
+                is_error: false,
+                message_timestamp: None,
+                turn_id: Some("turn-1".into()),
+            }],
+            affected_tool_results: 1,
+            estimated_tokens_freed: Some(4),
+            summarized_messages: None,
+            pre_compact_tokens: None,
+        });
+        manager.save(&session).unwrap();
+
+        let loaded = manager.load("audit-session").unwrap();
+
+        assert_eq!(loaded.compaction_audit.len(), 1);
+        assert_eq!(loaded.compaction_audit[0].kind, CompactionAuditKind::Microcompact);
+        assert_eq!(loaded.compaction_audit[0].tool_results[0].output, "original result");
+    }
+
+    #[test]
     fn test_load_session_without_context_state_uses_backward_compatible_default() {
         let mut value = serde_json::to_value(sample_session("old-session", "old-model")).unwrap();
-        value.as_object_mut().unwrap().remove("context_state");
+        let object = value.as_object_mut().unwrap();
+        object.remove("context_state");
+        object.remove("compaction_audit");
 
         let loaded: Session = serde_json::from_value(value).unwrap();
 
         assert_eq!(loaded.context_state.context_usage, 0);
         assert_eq!(loaded.context_state.compact_count, 0);
         assert_eq!(loaded.context_state.microcompact_count, 0);
+        assert!(loaded.compaction_audit.is_empty());
     }
 
     #[test]
@@ -542,6 +578,7 @@ mod tests {
                     text: format!("summary for {id}"),
                 }],
             )],
+            compaction_audit: Vec::new(),
         }
     }
 

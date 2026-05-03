@@ -13,6 +13,43 @@ use aion_types::message::{ContentBlock, Message, Role, TokenUsage};
 
 use crate::context_usage::ContextState;
 
+/// Raw tool execution captured before context compaction removes it from the
+/// live session history.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolExecutionAuditRecord {
+    pub tool_use_id: String,
+    pub tool_name: String,
+    pub input: serde_json::Value,
+    pub output: String,
+    pub is_error: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_timestamp: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionAuditKind {
+    Microcompact,
+    Autocompact,
+}
+
+/// One durable record written before a compaction operation drops history.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompactionAuditRecord {
+    pub kind: CompactionAuditKind,
+    pub created_at: DateTime<Utc>,
+    pub tool_results: Vec<ToolExecutionAuditRecord>,
+    pub affected_tool_results: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_tokens_freed: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summarized_messages: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_compact_tokens: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -34,6 +71,8 @@ pub struct Session {
     #[serde(default)]
     pub context_state: ContextState,
     pub messages: Vec<Message>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compaction_audit: Vec<CompactionAuditRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +132,7 @@ impl SessionManager {
             total_usage: TokenUsage::default(),
             context_state: ContextState::default(),
             messages: Vec::new(),
+            compaction_audit: Vec::new(),
         };
         self.with_session_lock(&session.id, || {
             if self.session_exists(&session.id)? {

@@ -1063,6 +1063,7 @@ mod tests_compact {
             total_usage: TokenUsage::default(),
             context_state,
             messages: Vec::new(),
+            compaction_audit: Vec::new(),
         };
         let provider: Arc<dyn LlmProvider> = Arc::new(NullProvider);
 

@@ -129,6 +129,7 @@ fn tc_2_3_02_insufficient_results_no_clearing() {
         MicrocompactResult {
             cleared_count: 0,
             estimated_tokens_freed: 0,
+            cleared_tool_results: vec![],
         }
     );
 }
@@ -292,6 +293,7 @@ fn tc_2_3_10_empty_messages() {
         MicrocompactResult {
             cleared_count: 0,
             estimated_tokens_freed: 0,
+            cleared_tool_results: vec![],
         }
     );
 }
