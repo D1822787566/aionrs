@@ -1,3 +1,4 @@
+use aion_types::llm::InvalidToolInput;
 use aion_types::message::{ContentBlock, StopReason, TokenUsage};
 
 /// Everything a single provider stream produces in one model turn.
@@ -10,6 +11,7 @@ pub(crate) struct StreamOutcome {
     pub(crate) thinking_signature: Option<String>,
     pub(crate) provider_items: Vec<ContentBlock>,
     pub(crate) tool_calls: Vec<ContentBlock>,
+    pub(crate) invalid_tool_inputs: Vec<InvalidToolInput>,
     pub(crate) stop_reason: StopReason,
     pub(crate) usage: TokenUsage,
 }

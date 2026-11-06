@@ -1,4 +1,4 @@
-use aion_types::{message::ContentBlock, skill_types::ContextModifier};
+use aion_types::{llm::InvalidToolInput, message::ContentBlock, skill_types::ContextModifier};
 
 pub(crate) const DEFAULT_MAX_TOOL_CALL_MALFORMED: usize = 3;
 pub(crate) const DEFAULT_MAX_TOOL_CALL_FAILURE: usize = 3;
@@ -158,6 +158,21 @@ pub(crate) fn tool_call_failure_fingerprint(tool_calls: &[ContentBlock]) -> Opti
     Some(ToolCallFailureFingerprint { calls: calls? })
 }
 
+pub(crate) fn invalid_tool_input_fingerprint(errors: &[InvalidToolInput]) -> Option<ToolCallFailureFingerprint> {
+    if errors.is_empty() {
+        return None;
+    }
+    let mut calls: Vec<_> = errors
+        .iter()
+        .map(|error| ToolCallFailureFingerprintPart {
+            name: error.name.clone(),
+            input: "invalid_json".into(),
+        })
+        .collect();
+    calls.sort_by(|a, b| a.name.cmp(&b.name));
+    Some(ToolCallFailureFingerprint { calls })
+}
+
 /// Interleave synthetic malformed-call results with executed-tool results back
 /// into the original `tool_calls` order.
 ///
@@ -166,10 +181,29 @@ pub(crate) fn tool_call_failure_fingerprint(tool_calls: &[ContentBlock]) -> Opti
 /// runtime policy rejected an otherwise valid call. Remaining calls consume
 /// the next result/modifier from the `executable_*` iterators. Kept as a free
 /// function so the interleaving invariant can be unit-tested in isolation.
+#[cfg(test)]
 pub(crate) fn merge_tool_results(
     tool_calls: &[ContentBlock],
     tool_call_malformed_reasons: &[Option<ToolCallMalformedReason>],
     policy_denied_tool_names: &[Option<String>],
+    executable_results: Vec<ContentBlock>,
+    executable_modifiers: Vec<Option<ContextModifier>>,
+) -> (Vec<ContentBlock>, Vec<Option<ContextModifier>>) {
+    merge_tool_results_with_validation(
+        tool_calls,
+        tool_call_malformed_reasons,
+        policy_denied_tool_names,
+        &vec![None; tool_calls.len()],
+        executable_results,
+        executable_modifiers,
+    )
+}
+
+pub(crate) fn merge_tool_results_with_validation(
+    tool_calls: &[ContentBlock],
+    tool_call_malformed_reasons: &[Option<ToolCallMalformedReason>],
+    policy_denied_tool_names: &[Option<String>],
+    validation_errors: &[Option<String>],
     executable_results: Vec<ContentBlock>,
     executable_modifiers: Vec<Option<ContextModifier>>,
 ) -> (Vec<ContentBlock>, Vec<Option<ContextModifier>>) {
@@ -178,10 +212,11 @@ pub(crate) fn merge_tool_results(
     let mut tool_results = Vec::with_capacity(tool_calls.len());
     let mut tool_modifiers = Vec::with_capacity(tool_calls.len());
 
-    for ((call, reason), denied_name) in tool_calls
+    for (((call, reason), denied_name), validation_error) in tool_calls
         .iter()
         .zip(tool_call_malformed_reasons)
         .zip(policy_denied_tool_names)
+        .zip(validation_errors)
     {
         if let Some(reason) = reason {
             let ContentBlock::ToolUse { id, name, .. } = call else {
@@ -202,6 +237,16 @@ pub(crate) fn merge_tool_results(
                     reason.description(),
                     reason.reissue_field()
                 ),
+                is_error: true,
+            });
+            tool_modifiers.push(None);
+        } else if let Some(error) = validation_error {
+            let ContentBlock::ToolUse { id, .. } = call else {
+                continue;
+            };
+            tool_results.push(ContentBlock::ToolResult {
+                tool_use_id: id.clone(),
+                content: error.clone(),
                 is_error: true,
             });
             tool_modifiers.push(None);
@@ -282,7 +327,6 @@ impl ToolCallFailureTracker {
         self.count
     }
 
-    #[cfg(test)]
     pub(crate) fn count(&self) -> usize {
         self.count
     }

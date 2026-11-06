@@ -243,8 +243,16 @@ mod tests {
             input: json!({}),
             extra: None,
         };
-        let (result, _, follow_up_blocks) =
-            execute_single(&registry, &call, None, aion_compact::CompactLevel::Off, false, 10_000).await;
+        let (result, _, follow_up_blocks) = execute_single(
+            &registry,
+            &call,
+            None,
+            aion_compact::CompactLevel::Off,
+            false,
+            10_000,
+            &Mutex::new(u64::MAX),
+        )
+        .await;
         assert!(follow_up_blocks.is_empty());
         if let ContentBlock::ToolResult { content, is_error, .. } = &result {
             assert!(is_error);
@@ -265,8 +273,16 @@ mod tests {
             input: json!({"tasks": "not_an_array"}),
             extra: None,
         };
-        let (result, _, follow_up_blocks) =
-            execute_single(&registry, &call, None, aion_compact::CompactLevel::Off, false, 10_000).await;
+        let (result, _, follow_up_blocks) = execute_single(
+            &registry,
+            &call,
+            None,
+            aion_compact::CompactLevel::Off,
+            false,
+            10_000,
+            &Mutex::new(u64::MAX),
+        )
+        .await;
         assert!(follow_up_blocks.is_empty());
         if let ContentBlock::ToolResult { content, is_error, .. } = &result {
             // Tool succeeds because input.get("tasks") is Some
@@ -286,8 +302,16 @@ mod tests {
             input: json!({"tasks": [{"name": "t1", "prompt": "do x"}]}),
             extra: None,
         };
-        let (result, _, follow_up_blocks) =
-            execute_single(&registry, &call, None, aion_compact::CompactLevel::Off, false, 10_000).await;
+        let (result, _, follow_up_blocks) = execute_single(
+            &registry,
+            &call,
+            None,
+            aion_compact::CompactLevel::Off,
+            false,
+            10_000,
+            &Mutex::new(u64::MAX),
+        )
+        .await;
         assert!(follow_up_blocks.is_empty());
         if let ContentBlock::ToolResult { content, is_error, .. } = &result {
             assert!(!is_error);
@@ -306,8 +330,16 @@ mod tests {
             input: json!({}),
             extra: None,
         };
-        let (result, _, follow_up_blocks) =
-            execute_single(&registry, &call, None, aion_compact::CompactLevel::Off, false, 10_000).await;
+        let (result, _, follow_up_blocks) = execute_single(
+            &registry,
+            &call,
+            None,
+            aion_compact::CompactLevel::Off,
+            false,
+            10_000,
+            &Mutex::new(u64::MAX),
+        )
+        .await;
         assert!(follow_up_blocks.is_empty());
         if let ContentBlock::ToolResult { content, is_error, .. } = &result {
             assert!(is_error);

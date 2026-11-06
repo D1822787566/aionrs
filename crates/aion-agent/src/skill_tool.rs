@@ -4,6 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
+use crate::skill_delivery::deliver_skill;
 use crate::spawner::Spawner;
 use aion_config::hooks::HooksConfig;
 use aion_protocol::events::ToolCategory;
@@ -11,16 +12,18 @@ use aion_skills::context_modifier::ContextModifier;
 use aion_skills::executor::{execute_fork, prepare_inline_content};
 use aion_skills::hooks::{parse_skill_hooks, to_hook_defs};
 use aion_skills::permissions::{SkillPermission, SkillPermissionChecker};
+use aion_skills::substitution::substitute_arguments;
 use aion_skills::types::{ExecutionContext, SkillMetadata};
 use aion_types::tool::{JsonSchema, ToolResult};
 
-use aion_tools::Tool;
+use aion_tools::{Tool, ToolExecutionOutput};
 
 /// A tool that allows the LLM to invoke named skills.
 ///
 /// Each skill is looked up by name (exact match, leading `/` stripped),
-/// its content is prepared with variable substitution and shell execution,
-/// and returned as a `ToolResult`.  The Skill list is injected into the
+/// direct native execution preserves substitution/shell/fork semantics.
+/// Engine inline loading substitutes variables without running embedded commands,
+/// and delivers complete instructions or explicit byte chunks as follow-up context.  The Skill list is injected into the
 /// system prompt in Phase 9; this tool's `description()` returns a fixed string.
 pub struct SkillTool {
     skills: Arc<Vec<SkillMetadata>>,
@@ -93,43 +96,7 @@ impl SkillTool {
             .collect::<Vec<_>>()
             .join(", ")
     }
-}
-
-#[async_trait]
-impl Tool for SkillTool {
-    fn name(&self) -> &str {
-        "Skill"
-    }
-
-    fn description(&self) -> &str {
-        "Invoke a named skill by name. \
-         Use the skill name exactly as listed in the system prompt. \
-         Optionally pass arguments as a single string."
-    }
-
-    fn input_schema(&self) -> JsonSchema {
-        json!({
-            "type": "object",
-            "properties": {
-                "skill": {
-                    "type": "string",
-                    "description": "The skill name. E.g., \"commit\", \"review-pr\", or \"pdf\""
-                },
-                "args": {
-                    "type": "string",
-                    "description": "Optional arguments for the skill"
-                }
-            },
-            "required": ["skill"]
-        })
-    }
-
-    fn is_concurrency_safe(&self, _input: &Value) -> bool {
-        // Skills may modify context; conservatively mark as not concurrency-safe.
-        false
-    }
-
-    async fn execute(&self, input: Value) -> ToolResult {
+    async fn execute_content(&self, input: Value, instructions_only: bool) -> ToolResult {
         let Some(skill_name) = input["skill"].as_str() else {
             return ToolResult {
                 content: "Missing required parameter: skill".to_string(),
@@ -174,6 +141,22 @@ impl Tool for SkillTool {
 
         match skill.execution_context {
             ExecutionContext::Inline => {
+                if instructions_only {
+                    let base = match &skill.skill_root {
+                        Some(root) => format!("Base directory for this skill: {root}\n\n{}", skill.content),
+                        None => skill.content.clone(),
+                    };
+                    return ToolResult {
+                        content: substitute_arguments(
+                            &base,
+                            args,
+                            &skill.argument_names,
+                            skill.skill_root.as_deref(),
+                            self.session_id.as_deref(),
+                        ),
+                        is_error: false,
+                    };
+                }
                 match prepare_inline_content(skill, args, self.session_id.as_deref(), &self.cwd).await {
                     Ok(content) => ToolResult {
                         content,
@@ -212,6 +195,67 @@ impl Tool for SkillTool {
                 }
             }
         }
+    }
+}
+
+#[async_trait]
+impl Tool for SkillTool {
+    fn name(&self) -> &str {
+        "Skill"
+    }
+
+    fn description(&self) -> &str {
+        "Invoke a named skill by name. \
+         Use the skill name exactly as listed in the system prompt. \
+         Optionally pass arguments as a single string. Inline instruction loading does not execute embedded commands. For chunked delivery use byte offset and limit; continue until complete=true."
+    }
+
+    fn input_schema(&self) -> JsonSchema {
+        json!({
+            "type": "object",
+            "properties": {
+                "skill": {
+                    "type": "string",
+                    "description": "The skill name. E.g., \"commit\", \"review-pr\", or \"pdf\""
+                },
+                "offset": {"type":"integer","minimum":0,"description":"Zero-based UTF-8 byte offset for chunked delivery"},
+                "limit": {"type":"integer","minimum":1,"description":"Maximum UTF-8 bytes in this skill chunk"},
+                "args": {
+                    "type": "string",
+                    "description": "Optional arguments for the skill"
+                }
+            },
+            "required": ["skill"]
+        })
+    }
+
+    fn is_concurrency_safe(&self, _input: &Value) -> bool {
+        // Skills may modify context; conservatively mark as not concurrency-safe.
+        false
+    }
+
+    async fn execute(&self, input: Value) -> ToolResult {
+        self.execute_content(input, false).await
+    }
+
+    async fn execute_with_follow_up(&self, input: Value) -> ToolExecutionOutput {
+        let name = input["skill"].as_str().unwrap_or_default().to_owned();
+        // Fork is an explicit native execution mode, not instruction loading.
+        if self
+            .find_skill(&name)
+            .is_some_and(|s| s.execution_context == ExecutionContext::Fork)
+        {
+            if input.get("offset").is_some() || input.get("limit").is_some() {
+                return ToolResult {
+                    content: "Fork execution does not support instruction byte ranges.".into(),
+                    is_error: true,
+                }
+                .into();
+            }
+            return self.execute(input).await.into();
+        }
+        let result = self.execute_content(input.clone(), true).await;
+        deliver_skill(&name, &input, result)
     }
 
     fn context_modifier_for(&self, input: &serde_json::Value) -> Option<ContextModifier> {

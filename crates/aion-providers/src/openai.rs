@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use aion_types::llm::{LlmEvent, LlmRequest};
+use aion_types::llm::{InvalidToolInput, LlmEvent, LlmRequest};
 use aion_types::message::{StopReason, TokenUsage};
 
 use crate::composed::ComposedProvider;
@@ -217,8 +217,18 @@ pub(crate) fn parse_sse_chunk(data: &str, state: &mut StreamState, auto_tool_id:
                         } else {
                             tc.id
                         };
-                        let input: Value =
-                            serde_json::from_str(&tc.arguments).unwrap_or(Value::Object(serde_json::Map::new()));
+                        let input: Value = match serde_json::from_str(&tc.arguments) {
+                            Ok(input) => input,
+                            Err(error) => {
+                                events.push(LlmEvent::InvalidToolInput(InvalidToolInput {
+                                    id,
+                                    name: tc.name,
+                                    line: error.line(),
+                                    column: error.column(),
+                                }));
+                                continue;
+                            }
+                        };
                         if tc.name.is_empty() {
                             tracing::warn!(
                                 target: "aion_providers",

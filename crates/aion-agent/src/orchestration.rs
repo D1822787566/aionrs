@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::confirm::{ConfirmResult, ToolConfirmer};
+use crate::skill_delivery::reserve_skill_context;
 use aion_config::compact::CompactConfig;
 use aion_config::hooks::HookEngine;
 use aion_protocol::events::{OutputType, ProtocolEvent, ToolCategory, ToolInfo, ToolStatus};
@@ -10,6 +11,7 @@ use aion_types::message::ContentBlock;
 use aion_types::skill_types::ContextModifier;
 use aion_types::tool::ToolResult;
 
+use aion_tools::validation::format_tool_input_error;
 use aion_tools::{registry::ToolRegistry, truncate_utf8};
 
 /// The combined output of a tool execution batch: protocol content blocks
@@ -18,6 +20,18 @@ pub struct ToolCallOutcome {
     pub results: Vec<ContentBlock>,
     pub modifiers: Vec<Option<ContextModifier>>,
     pub follow_up_blocks: Vec<ContentBlock>,
+}
+
+fn validation_failure(registry: &ToolRegistry, call: &ContentBlock) -> Option<ContentBlock> {
+    let ContentBlock::ToolUse { id, name, input, .. } = call else {
+        return None;
+    };
+    let errors = registry.get(name)?.validate_input(input).err()?;
+    Some(ContentBlock::ToolResult {
+        tool_use_id: id.clone(),
+        content: format_tool_input_error(name, &errors),
+        is_error: true,
+    })
 }
 
 impl std::ops::Deref for ToolCallOutcome {
@@ -50,6 +64,7 @@ pub async fn execute_tool_calls(
         compaction_level,
         toon_enabled,
         CompactConfig::default().tool_output_max_bytes,
+        u64::MAX,
     )
     .await
 }
@@ -63,7 +78,9 @@ pub(crate) async fn execute_tool_calls_with_output_limit(
     compaction_level: aion_compact::CompactLevel,
     toon_enabled: bool,
     tool_output_max_bytes: usize,
+    skill_context_budget: u64,
 ) -> Result<ToolCallOutcome, ExecutionControl> {
+    let skill_context_budget = Mutex::new(skill_context_budget);
     let mut results = Vec::new();
     let mut modifiers = Vec::new();
     let mut follow_up_blocks = Vec::new();
@@ -75,6 +92,11 @@ pub(crate) async fn execute_tool_calls_with_output_limit(
             // so no skill hooks merging is needed here.
             let mut approved = Vec::new();
             for call in &batch.calls {
+                if let Some(invalid) = validation_failure(registry, call) {
+                    results.push(invalid);
+                    modifiers.push(None);
+                    continue;
+                }
                 match confirm_call(confirmer, call)? {
                     Some(denied) => {
                         results.push(denied);
@@ -95,6 +117,7 @@ pub(crate) async fn execute_tool_calls_with_output_limit(
                         compaction_level,
                         toon_enabled,
                         tool_output_max_bytes,
+                        &skill_context_budget,
                     )
                 })
                 .collect();
@@ -106,6 +129,11 @@ pub(crate) async fn execute_tool_calls_with_output_limit(
             }
         } else {
             for call in &batch.calls {
+                if let Some(invalid) = validation_failure(registry, call) {
+                    results.push(invalid);
+                    modifiers.push(None);
+                    continue;
+                }
                 match confirm_call(confirmer, call)? {
                     Some(denied) => {
                         results.push(denied);
@@ -125,6 +153,7 @@ pub(crate) async fn execute_tool_calls_with_output_limit(
                                 compaction_level,
                                 toon_enabled,
                                 tool_output_max_bytes,
+                                &skill_context_budget,
                             )
                             .await;
                         }
@@ -189,6 +218,7 @@ async fn execute_single(
     compaction_level: aion_compact::CompactLevel,
     toon_enabled: bool,
     tool_output_max_bytes: usize,
+    skill_context_budget: &Mutex<u64>,
 ) -> (ContentBlock, Option<ContextModifier>, Vec<ContentBlock>) {
     let ContentBlock::ToolUse { id, name, input, .. } = call else {
         unreachable!("execute_single called with non-ToolUse block")
@@ -215,7 +245,11 @@ async fn execute_single(
     let (result, modifier, follow_up_blocks) = match registry.get(name) {
         Some(tool) => {
             let max_size = tool.max_result_size();
-            let execution = tool.execute_with_follow_up(input.clone()).await;
+            let mut execution = tool.execute_with_follow_up(input.clone()).await;
+            {
+                let mut remaining = skill_context_budget.lock().unwrap_or_else(|e| e.into_inner());
+                reserve_skill_context(&mut execution, &mut remaining);
+            }
             let r = execution.result;
             let modifier = if r.is_error {
                 None
@@ -232,8 +266,13 @@ async fn execute_single(
             } else {
                 r.content.clone()
             };
-            let content = aion_compact::compact_output(&error_content, compaction_level);
-            let content = if toon_enabled {
+            // Read ranges must preserve whitespace and line endings for exact continuation.
+            let content = if name == "Read" {
+                error_content
+            } else {
+                aion_compact::compact_output(&error_content, compaction_level)
+            };
+            let content = if toon_enabled && name != "Read" {
                 aion_compact::compact_output_toon(&content)
             } else {
                 content
@@ -318,6 +357,7 @@ pub async fn execute_tool_calls_with_approval(
         compaction_level,
         toon_enabled,
         CompactConfig::default().tool_output_max_bytes,
+        u64::MAX,
     )
     .await
 }
@@ -335,7 +375,9 @@ pub(crate) async fn execute_tool_calls_with_approval_and_output_limit(
     compaction_level: aion_compact::CompactLevel,
     toon_enabled: bool,
     tool_output_max_bytes: usize,
+    skill_context_budget: u64,
 ) -> Result<ToolCallOutcome, ExecutionControl> {
+    let skill_context_budget = Mutex::new(skill_context_budget);
     let mut results = Vec::new();
     let mut modifiers = Vec::new();
     let mut follow_up_blocks = Vec::new();
@@ -344,6 +386,12 @@ pub(crate) async fn execute_tool_calls_with_approval_and_output_limit(
         let ContentBlock::ToolUse { id, name, input, .. } = call else {
             continue;
         };
+
+        if let Some(invalid) = validation_failure(registry, call) {
+            results.push(invalid);
+            modifiers.push(None);
+            continue;
+        }
 
         let tool = registry.get(name);
         let category = tool.map(|t| t.category()).unwrap_or(ToolCategory::Exec);
@@ -411,6 +459,7 @@ pub(crate) async fn execute_tool_calls_with_approval_and_output_limit(
                 compaction_level,
                 toon_enabled,
                 tool_output_max_bytes,
+                &skill_context_budget,
             )
             .await;
         }

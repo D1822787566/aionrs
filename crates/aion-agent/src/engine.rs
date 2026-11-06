@@ -7,7 +7,6 @@ use crate::cache_diagnostics::{CacheBreakDetector, CacheDiagnostic, CacheStats};
 use crate::commands::{CommandContext, CommandRegistry, CommandResult, CommandSpec, SlashCommand, default_registry};
 use crate::compact::auto::{CompactError, autocompact, should_autocompact};
 use crate::compact::emergency::is_at_emergency_limit;
-use crate::compact::estimate::{estimate_tokens_from_tool_image, estimate_tokens_from_tool_result};
 use crate::compact::micro::{microcompact, should_microcompact, snapshot_live_tool_results};
 use crate::compact::state::CompactState;
 use crate::confirm::ToolConfirmer;
@@ -24,12 +23,18 @@ use crate::plan::prompt::plan_mode_instructions;
 use crate::plan::state::PlanState;
 use crate::session::{CompactionAuditKind, CompactionAuditRecord, Session, SessionManager};
 use crate::stream::StreamOutcome;
+#[cfg(test)]
+use crate::tool_call::merge_tool_results;
 use crate::tool_call::{
     DEFAULT_MAX_TOOL_CALL_FAILURE, DEFAULT_MAX_TOOL_CALL_MALFORMED, ToolCallFailureFingerprint,
-    ToolCallMalformedFingerprint, merge_tool_results, tool_call_failure_fingerprint, tool_call_malformed_fingerprint,
-    tool_call_malformed_reason,
+    ToolCallMalformedFingerprint, invalid_tool_input_fingerprint, merge_tool_results_with_validation,
+    tool_call_failure_fingerprint, tool_call_malformed_fingerprint, tool_call_malformed_reason,
 };
 use crate::tool_policy::ToolPolicy;
+use crate::tool_recovery::{
+    TEXT_CALL_RETRY_LIMIT, TEXT_CALL_RETRY_PROMPT, invalid_input_feedback, textual_tool_call,
+    tool_call_examples_requested,
+};
 use crate::turn::{FinalizationReason, ToolLoopWarning, TurnGuardAction, TurnGuards, TurnKind, TurnOutcome};
 use aion_compact::CompactLevel;
 use aion_config::compact::CompactConfig;
@@ -37,10 +42,11 @@ use aion_config::compat::ProviderCompat;
 use aion_config::config::{CompactContextWindowSource, Config};
 use aion_config::hooks::HookEngine;
 use aion_protocol::ToolApprovalManager;
-use aion_protocol::events::ToolCategory;
+use aion_protocol::events::{OutputType, ProtocolEvent, ToolCategory, ToolStatus};
 use aion_protocol::writer::ProtocolEmitter;
 use aion_providers::provider::{LlmProvider, create_provider};
 use aion_tools::registry::ToolRegistry;
+use aion_tools::validation::format_tool_input_error;
 use aion_types::llm::{LlmEvent, LlmRequest, ThinkingConfig};
 use aion_types::message::{ContentBlock, ImageInputCapability, Message, Role, StopReason, TokenUsage};
 use aion_types::skill_types::{ContextModifier, PlanModeTransition, effort_to_string};
@@ -368,6 +374,13 @@ impl AgentEngine {
         self.tools.tool_names()
     }
 
+    /// Whether a tool is included in a normal turn under current mode and policy.
+    pub fn is_tool_advertised(&self, name: &str) -> bool {
+        self.tool_definitions_for_turn(TurnKind::Normal)
+            .iter()
+            .any(|tool| tool.name == name && !tool.deferred)
+    }
+
     pub fn registry_mut(&mut self) -> &mut ToolRegistry {
         &mut self.tools
     }
@@ -515,6 +528,9 @@ impl AgentEngine {
         );
         self.output.emit_stream_start(msg_id);
 
+        let displaying_examples = content_blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Text {text} if tool_call_examples_requested(text)));
         let user_tokens = estimate_content_tokens(&content_blocks);
         self.push_history(Role::User, content_blocks);
         self.record_local_context_addition(user_tokens);
@@ -525,6 +541,7 @@ impl AgentEngine {
             self.max_tool_call_malformed_turns,
             self.max_tool_call_failure_turns,
         );
+        let mut textual_retries = 0;
         loop {
             if let Some(limit) = guards.turn_budget_reached() {
                 self.save_session();
@@ -544,17 +561,47 @@ impl AgentEngine {
             let outcome = self.run_turn(TurnKind::Normal).await?;
             guards.record_counted_turn();
 
-            let tool_calls = match TurnOutcome::from_stream(outcome) {
+            let (tool_calls, invalid_tool_inputs) = match TurnOutcome::from_stream(outcome) {
                 TurnOutcome::ToolRound(outcome) => {
                     let assistant_content = build_assistant_content(&outcome);
                     self.push_history(Role::Assistant, assistant_content);
                     self.save_session();
-                    outcome.tool_calls
+                    (outcome.tool_calls, outcome.invalid_tool_inputs)
                 }
                 TurnOutcome::Final(outcome) => {
                     let assistant_content = build_assistant_content(&outcome);
                     self.push_history(Role::Assistant, assistant_content);
                     self.save_session();
+                    let definitions = self.tool_definitions_for_turn(TurnKind::Normal);
+                    if !displaying_examples
+                        && textual_tool_call(&outcome.assistant_text, |name| {
+                            definitions.iter().any(|tool| tool.name == name)
+                        })
+                    {
+                        if textual_retries >= TEXT_CALL_RETRY_LIMIT {
+                            let message = "The operation was not completed: the model repeatedly returned tool-call text without issuing a formal call. Those textual calls were not executed.";
+                            self.output.emit_error(message);
+                            self.push_history(Role::Assistant, vec![ContentBlock::Text { text: message.into() }]);
+                            self.save_session();
+                            return Ok(AgentResult {
+                                text: message.into(),
+                                stop_reason: StopReason::MaxTurns,
+                                usage: self.total_usage.clone(),
+                                turns: guards.counted_turns(),
+                            });
+                        }
+                        textual_retries += 1;
+                        warn!(target: "aion_agent", attempt = textual_retries, "retrying textual tool call; operation not executed");
+                        self.output
+                            .emit_info("Tool call was not executed; requesting a formal tool call.");
+                        let blocks = vec![ContentBlock::Text {
+                            text: TEXT_CALL_RETRY_PROMPT.into(),
+                        }];
+                        self.record_local_context_addition(estimate_content_tokens(&blocks));
+                        self.push_history(Role::User, blocks);
+                        self.save_session();
+                        continue;
+                    }
                     return Ok(AgentResult {
                         text: outcome.assistant_text,
                         stop_reason: outcome.stop_reason,
@@ -617,23 +664,37 @@ impl AgentEngine {
                 tool_modifiers,
                 follow_up_blocks,
                 tool_call_malformed_fingerprint,
-                tool_call_failure_fingerprint,
-                all_tool_results_error,
+                mut tool_call_failure_fingerprint,
+                mut all_tool_results_error,
+                mut tool_round_preserves_failure_state,
             } = self.execute_tool_round(&tool_calls).await?;
+
+            if !invalid_tool_inputs.is_empty() {
+                tool_call_failure_fingerprint = invalid_tool_input_fingerprint(&invalid_tool_inputs);
+                all_tool_results_error = tool_results
+                    .iter()
+                    .all(|result| matches!(result, ContentBlock::ToolResult { is_error: true, .. }));
+                tool_round_preserves_failure_state = false;
+            }
+            self.load_discovered_tool_schemas(&tool_calls, &tool_results);
 
             // Apply any context modifiers from skill executions before the next turn.
             self.apply_context_modifiers(&tool_modifiers);
 
-            let guard_action = guards.after_tool_round(
+            let guard_action = guards.after_tool_round_with_preserve(
                 tool_call_malformed_fingerprint,
                 tool_call_failure_fingerprint,
                 all_tool_results_error,
+                tool_round_preserves_failure_state,
             );
             if let TurnGuardAction::Warn(warning) = guard_action {
                 append_tool_loop_warning(&mut tool_results, warning);
             }
 
             self.emit_tool_results(&tool_calls, &tool_results);
+            tool_results.extend(invalid_tool_inputs.iter().map(|error| ContentBlock::Text {
+                text: invalid_input_feedback(error),
+            }));
             self.record_tool_context_estimate(&tool_results, &follow_up_blocks);
 
             self.push_history(Role::User, tool_results);
@@ -750,13 +811,46 @@ impl AgentEngine {
                 (!self.tool_policy.allows(name) || capability_denied).then(|| name.clone())
             })
             .collect();
+        let validation_errors: Vec<_> = tool_calls
+            .iter()
+            .zip(&tool_call_malformed_reasons)
+            .zip(&policy_denied_tool_names)
+            .map(|((call, malformed_reason), denied_name)| {
+                if malformed_reason.is_some() || denied_name.is_some() {
+                    return None;
+                }
+                let ContentBlock::ToolUse { name, input, .. } = call else {
+                    return None;
+                };
+                self.tools
+                    .get(name)
+                    .and_then(|tool| tool.validate_input(input).err())
+                    .map(|errors| format_tool_input_error(name, &errors))
+            })
+            .collect();
         let executable_tool_calls: Vec<_> = tool_calls
             .iter()
             .zip(&tool_call_malformed_reasons)
             .zip(&policy_denied_tool_names)
-            .filter(|((_, malformed_reason), denied_name)| malformed_reason.is_none() && denied_name.is_none())
-            .map(|((call, _), _)| call.clone())
+            .zip(&validation_errors)
+            .filter(|(((_, malformed_reason), denied_name), validation_error)| {
+                malformed_reason.is_none() && denied_name.is_none() && validation_error.is_none()
+            })
+            .map(|(((call, _), _), _)| call.clone())
             .collect();
+
+        // Reserve worst-case result text for the entire round before allocating skill context.
+        let input_limit = self.compact_config.context_window.saturating_sub(
+            self.compact_config
+                .output_reserve
+                .max(self.compact_config.emergency_buffer),
+        );
+        let result_reserve = (executable_tool_calls.len() as u64)
+            .saturating_mul(self.compact_config.tool_output_max_bytes.div_ceil(4) as u64);
+        let skill_context_budget = (input_limit as u64)
+            .saturating_sub(self.context_state.context_usage)
+            .saturating_sub(result_reserve)
+            .saturating_sub(256);
 
         let (executable_results, executable_modifiers, follow_up_blocks) = if executable_tool_calls.is_empty() {
             (Vec::new(), Vec::new(), Vec::new())
@@ -779,6 +873,7 @@ impl AgentEngine {
                 self.compact_level,
                 self.toon_enabled,
                 self.compact_config.tool_output_max_bytes,
+                skill_context_budget,
             )
             .await
             {
@@ -798,6 +893,7 @@ impl AgentEngine {
                 self.compact_level,
                 self.toon_enabled,
                 self.compact_config.tool_output_max_bytes,
+                skill_context_budget,
             )
             .await
             {
@@ -809,28 +905,50 @@ impl AgentEngine {
             }
         };
 
-        let (tool_results, tool_modifiers) = merge_tool_results(
+        let (tool_results, tool_modifiers) = merge_tool_results_with_validation(
             tool_calls,
             &tool_call_malformed_reasons,
             &policy_denied_tool_names,
+            &validation_errors,
             executable_results,
             executable_modifiers,
         );
+        self.emit_validation_events(tool_calls, &validation_errors);
 
         let failed_tool_calls: Vec<_> = tool_calls
             .iter()
             .zip(&tool_call_malformed_reasons)
+            .zip(&validation_errors)
             .zip(&tool_results)
-            .filter(|((_, malformed_reason), result)| {
+            .filter(|(((_, malformed_reason), _), result)| {
                 malformed_reason.is_none() && matches!(result, ContentBlock::ToolResult { is_error: true, .. })
             })
-            .map(|((call, _), _)| call.clone())
+            .map(|(((call, _), validation_error), _)| {
+                if let Some(validation_error) = validation_error {
+                    let ContentBlock::ToolUse { id, name, .. } = call else {
+                        return call.clone();
+                    };
+                    return ContentBlock::ToolUse {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input: serde_json::json!({"validation_error": validation_error}),
+                        extra: None,
+                    };
+                }
+                call.clone()
+            })
             .collect();
         let tool_call_failure_fingerprint = tool_call_failure_fingerprint(&failed_tool_calls);
         let all_tool_results_error = tool_call_failure_fingerprint.is_some()
             && tool_results
                 .iter()
                 .all(|result| matches!(result, ContentBlock::ToolResult { is_error: true, .. }));
+        let tool_round_preserves_failure_state = tool_calls
+            .iter()
+            .all(|call| matches!(call, ContentBlock::ToolUse { name, .. } if name == "ToolSearch"))
+            && tool_results
+                .iter()
+                .all(|result| matches!(result, ContentBlock::ToolResult { is_error: false, .. }));
 
         Ok(ToolRoundOutput {
             tool_results,
@@ -839,7 +957,63 @@ impl AgentEngine {
             tool_call_malformed_fingerprint,
             tool_call_failure_fingerprint,
             all_tool_results_error,
+            tool_round_preserves_failure_state,
         })
+    }
+
+    fn load_discovered_tool_schemas(&mut self, tool_calls: &[ContentBlock], tool_results: &[ContentBlock]) {
+        let mut names = Vec::new();
+        for result in tool_results {
+            let ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error: false,
+                ..
+            } = result
+            else {
+                continue;
+            };
+            let is_tool_search = tool_calls.iter().any(|call| {
+                matches!(call, ContentBlock::ToolUse { id, name, .. } if id == tool_use_id && name == "ToolSearch")
+            });
+            if !is_tool_search {
+                continue;
+            }
+            let Ok(matches) = serde_json::from_str::<Vec<serde_json::Value>>(content) else {
+                continue;
+            };
+            names.extend(
+                matches
+                    .into_iter()
+                    .filter_map(|item| item.get("name").and_then(|name| name.as_str()).map(str::to_owned)),
+            );
+        }
+        if !names.is_empty() {
+            self.tools.mark_deferred_loaded(names);
+        }
+    }
+
+    fn emit_validation_events(&self, tool_calls: &[ContentBlock], validation_errors: &[Option<String>]) {
+        let Some(writer) = self.protocol_writer.as_ref() else {
+            return;
+        };
+        for (call, error) in tool_calls.iter().zip(validation_errors) {
+            let Some(error) = error else {
+                continue;
+            };
+            let ContentBlock::ToolUse { id, name, .. } = call else {
+                continue;
+            };
+            let _ = writer.emit(&ProtocolEvent::ToolResult {
+                msg_id: self.msg_id.clone(),
+                call_id: id.clone(),
+                tool_name: name.clone(),
+                status: ToolStatus::Error,
+                output: error.clone(),
+                output_type: OutputType::Text,
+                metadata: Some(serde_json::json!({"executed": false})),
+            });
+        }
     }
 
     /// Emit each tool result to the output sink, resolving the tool name from
@@ -920,7 +1094,8 @@ impl AgentEngine {
     ) -> Result<AgentResult, AgentError> {
         let outcome = self.run_turn(TurnKind::Finalization(reason)).await?;
         let combined_text = format!("{}{}", prefix_text, outcome.assistant_text);
-        let is_success = outcome.tool_calls.is_empty()
+        let is_success = outcome.invalid_tool_inputs.is_empty()
+            && outcome.tool_calls.is_empty()
             && outcome.stop_reason == StopReason::EndTurn
             && !outcome.assistant_text.trim().is_empty();
 
@@ -979,6 +1154,7 @@ impl AgentEngine {
         let mut thinking_signature: Option<String> = None;
         let mut provider_items: Vec<ContentBlock> = Vec::new();
         let mut tool_calls: Vec<ContentBlock> = Vec::new();
+        let mut invalid_tool_inputs = Vec::new();
         let mut stop_reason = StopReason::EndTurn;
         let mut usage = TokenUsage::default();
 
@@ -987,6 +1163,24 @@ impl AgentEngine {
                 LlmEvent::TextDelta(text) => {
                     self.output.emit_text_delta(&text, &self.msg_id);
                     assistant_text.push_str(&text);
+                }
+                LlmEvent::InvalidToolInput(error) => {
+                    let feedback = invalid_input_feedback(&error);
+                    warn!(target: "aion_agent", tool = %error.name, call_id = %error.id,
+                        line = error.line, column = error.column, "invalid tool argument JSON; not executed");
+                    self.output.emit_tool_result(&error.id, &error.name, true, &feedback);
+                    if let Some(writer) = &self.protocol_writer {
+                        let _ = writer.emit(&ProtocolEvent::ToolResult {
+                            msg_id: self.msg_id.clone(),
+                            call_id: error.id.clone(),
+                            tool_name: error.name.clone(),
+                            status: ToolStatus::Error,
+                            output: feedback,
+                            output_type: OutputType::Text,
+                            metadata: Some(serde_json::json!({"executed":false,"reason":"invalid_json"})),
+                        });
+                    }
+                    invalid_tool_inputs.push(error);
                 }
                 LlmEvent::ToolUse { id, name, input, extra } => {
                     if id.trim().is_empty() {
@@ -1036,6 +1230,7 @@ impl AgentEngine {
             thinking_signature,
             provider_items,
             tool_calls,
+            invalid_tool_inputs,
             stop_reason,
             usage,
         })
@@ -1086,26 +1281,13 @@ impl AgentEngine {
         true
     }
 
-    /// Add content produced after the provider usage snapshot. Every final
-    /// tool result is estimated once; tool-emitted images are counted because
-    /// they are also sent in the next provider request.
-    fn record_tool_context_estimate(&mut self, tool_results: &[ContentBlock], tool_images: &[ContentBlock]) {
-        let tool_result_tokens = tool_results.iter().fold(0_u64, |total, result| {
-            total.saturating_add(estimate_tokens_from_tool_result(result))
-        });
-        let tool_image_tokens = tool_images.iter().fold(0_u64, |total, image| {
-            total.saturating_add(estimate_tokens_from_tool_image(image))
-        });
-        let added_tokens = tool_result_tokens.saturating_add(tool_image_tokens);
-
-        self.record_local_context_addition(added_tokens);
-        debug!(
-            target: "aion_agent",
-            tool_result_tokens,
-            tool_image_tokens,
-            context_tokens = self.compact_state.last_input_tokens,
-            "tool results added to context token estimate"
-        );
+    /// Count all tool results and follow-up blocks before the next threshold check.
+    fn record_tool_context_estimate(&mut self, tool_results: &[ContentBlock], follow_up_blocks: &[ContentBlock]) {
+        let tool_result_tokens = estimate_content_tokens(tool_results);
+        let follow_up_tokens = estimate_content_tokens(follow_up_blocks);
+        self.record_local_context_addition(tool_result_tokens.saturating_add(follow_up_tokens));
+        debug!(target: "aion_agent", tool_result_tokens, follow_up_tokens,
+            context_tokens = self.compact_state.last_input_tokens, "tool context estimated");
     }
 
     fn record_local_context_addition(&mut self, tokens: u64) {
@@ -1724,6 +1906,7 @@ struct ToolRoundOutput {
     tool_call_failure_fingerprint: Option<ToolCallFailureFingerprint>,
     /// Whether the round had a non-malformed call and every result was an error.
     all_tool_results_error: bool,
+    tool_round_preserves_failure_state: bool,
 }
 
 fn append_tool_loop_warning(tool_results: &mut [ContentBlock], warning: ToolLoopWarning) {
@@ -1761,6 +1944,11 @@ fn build_assistant_content(outcome: &StreamOutcome) -> Vec<ContentBlock> {
         });
     }
     content.extend(outcome.tool_calls.iter().cloned());
+    if !outcome.invalid_tool_inputs.is_empty() {
+        content.push(ContentBlock::Text {
+            text: "Some requested tool calls had invalid JSON and were not executed.".into(),
+        });
+    }
     content
 }
 

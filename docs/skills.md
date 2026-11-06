@@ -11,8 +11,19 @@ invokes a skill, it:
 
 1. Resolves the skill by name from the loaded skill list
 2. Substitutes variables (`$ARGUMENTS`, `$0`, `${AIONRS_SKILL_DIR}`)
-3. Expands any shell commands (`` !`cmd` `` syntax)
-4. Returns the processed text as the skill's output
+3. Keeps embedded commands as text during model-facing inline loading
+4. Returns a short `skill_loaded` ToolResult and sends the complete instructions in a separate user-context message
+
+Skill instructions count toward the context budget. If the complete text does not fit the
+remaining budget, the engine returns `skill_requires_chunked_read` without delivering a
+partial body. Retry `Skill` with the same skill/arguments and the suggested `offset` and
+`limit` (zero-based UTF-8 bytes). A chunk returns `skill_chunk_loaded`, `next_offset`,
+`content_bytes`, `total_bytes`, and `complete`; `complete=true` means the end was reached,
+while `full_content=true` means the entire skill was delivered in this single call.
+When no usable budget remains, compact or start a new conversation.
+
+Ordinary tool results retain their default 10,000-byte limit. Skill text uses the
+existing follow-up context channel, not an increased global output limit.
 
 ## Directory Structure
 
@@ -136,8 +147,14 @@ Working directory: ${AIONRS_SKILL_DIR}
 
 ## Shell Command Expansion
 
-Lines containing `` !`cmd` `` execute `cmd` in a shell and substitute the
-output inline:
+The direct native execution API and explicit fork mode can execute `` !`cmd` ``
+and substitute its output. Model-facing inline `Skill` loading keeps this syntax as
+instructions; the model must issue a separate permitted tool call to run a command.
+Host-selected skills are always loaded as plain instructions and never activate native
+shell expansion or skill hooks. Existing explicitly configured native hooks and fork
+execution retain their own execution semantics.
+
+Example for the native execution API:
 
 ```markdown
 ---

@@ -352,3 +352,23 @@ mod tests {
         assert!(matches!(&events[0], LlmEvent::ThinkingDelta(text) if text == "primary"));
     }
 }
+
+#[test]
+fn invalid_json_arguments_are_not_executable_or_confused_with_empty_objects() {
+    for (arguments, invalid) in [("{", true), ("{\"cmd\":", true), ("{}", false)] {
+        let frame = serde_json::json!({"choices":[{"delta":{"tool_calls":[{
+            "index":0,"id":"bad-id","function":{"name":"EnterPlanMode","arguments":arguments}
+        }]},"finish_reason":"tool_calls"}]})
+        .to_string();
+        let events = parse_sse_chunk(&frame, &mut StreamState::new(), false);
+        assert_eq!(
+            events.iter().any(|e| matches!(e, LlmEvent::InvalidToolInput(_))),
+            invalid
+        );
+        assert_eq!(events.iter().any(|e| matches!(e, LlmEvent::ToolUse { .. })), !invalid);
+        if let LlmEvent::InvalidToolInput(error) = &events[0] {
+            assert_eq!(error.id, "bad-id");
+            assert_eq!(error.name, "EnterPlanMode");
+        }
+    }
+}

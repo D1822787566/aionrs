@@ -21,12 +21,16 @@ pub struct StreamableHttpTransport {
 impl StreamableHttpTransport {
     /// Create a new Streamable HTTP transport
     pub async fn connect(url: &str, headers: &HashMap<String, String>) -> Result<Self, McpError> {
+        let parsed = reqwest::Url::parse(url).map_err(|_| McpError::InitFailed("Invalid HTTP URL".into()))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(McpError::InitFailed("MCP HTTP transport requires http or https".into()));
+        }
         let mut header_map = HeaderMap::new();
         for (k, v) in headers {
             let name = reqwest::header::HeaderName::from_bytes(k.as_bytes())
-                .map_err(|e| McpError::Transport(format!("Invalid header name '{}': {}", k, e)))?;
-            let value = HeaderValue::from_str(v)
-                .map_err(|e| McpError::Transport(format!("Invalid header value '{}': {}", v, e)))?;
+                .map_err(|e| McpError::InitFailed(format!("Invalid header name '{}': {}", k, e)))?;
+            let value =
+                HeaderValue::from_str(v).map_err(|e| McpError::InitFailed(format!("Invalid header value: {}", e)))?;
             header_map.insert(name, value);
         }
 
@@ -152,10 +156,7 @@ impl McpTransport for StreamableHttpTransport {
             .map_err(|e| McpError::Transport(format!("HTTP request failed: {}", e)))?;
 
         if !response.status().is_success() {
-            return Err(McpError::Transport(format!(
-                "HTTP request returned status: {}",
-                response.status()
-            )));
+            return Err(McpError::HttpStatus(response.status().as_u16()));
         }
 
         let rpc_response = self.parse_response(response).await?;
@@ -175,10 +176,13 @@ impl McpTransport for StreamableHttpTransport {
             serde_json::to_string(req).map_err(|e| McpError::Transport(format!("JSON serialize error: {}", e)))?;
 
         let http_req = self.build_request(&body).await;
-        http_req
+        let response = http_req
             .send()
             .await
             .map_err(|e| McpError::Transport(format!("Notification request failed: {}", e)))?;
+        if !response.status().is_success() {
+            return Err(McpError::HttpStatus(response.status().as_u16()));
+        }
 
         Ok(())
     }

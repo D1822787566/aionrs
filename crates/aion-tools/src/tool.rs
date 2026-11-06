@@ -7,6 +7,8 @@ use aion_types::message::ContentBlock;
 use aion_types::skill_types::ContextModifier;
 use aion_types::tool::{JsonSchema, ToolResult};
 
+use crate::validation::{ToolInputValidationError, validate_tool_input};
+
 /// Complete output from one tool execution.
 ///
 /// Most tools only return a textual [`ToolResult`]. Tools that load provider
@@ -51,6 +53,11 @@ pub trait Tool: Send + Sync {
     /// JSON Schema for input parameters
     fn input_schema(&self) -> JsonSchema;
 
+    /// Validate arguments before approval, hooks, or execution.
+    fn validate_input(&self, input: &Value) -> Result<(), Vec<ToolInputValidationError>> {
+        validate_tool_input(&self.input_schema(), input)
+    }
+
     /// Whether this tool is safe to run concurrently
     fn is_concurrency_safe(&self, input: &Value) -> bool;
 
@@ -92,6 +99,11 @@ pub trait Tool: Send + Sync {
     /// The agent-level output limit may impose a smaller bound.
     fn max_result_size(&self) -> usize {
         50_000
+    }
+
+    /// MCP server and original tool identity, used for scoped runtime recovery.
+    fn mcp_origin(&self) -> Option<(&str, &str)> {
+        None
     }
 
     /// Tool category for protocol classification

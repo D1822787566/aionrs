@@ -229,6 +229,29 @@ impl McpManager {
             .count()
     }
 
+    /// Query a live server without executing a tool, including session validity.
+    pub async fn list_server_tools(&self, server_name: &str) -> Result<Vec<McpToolDef>, McpError> {
+        let server = self
+            .servers
+            .get(server_name)
+            .ok_or_else(|| McpError::ServerNotFound(server_name.to_owned()))?;
+        let response = server
+            .transport
+            .request(&JsonRpcRequest::new(
+                self.next_id.fetch_add(1, Ordering::Relaxed),
+                "tools/list",
+                None,
+            ))
+            .await?;
+        let result: ToolsListResult = serde_json::from_value(
+            response
+                .result
+                .ok_or_else(|| McpError::InitFailed("No result in tools/list response".to_owned()))?,
+        )
+        .map_err(|error| McpError::InitFailed(format!("Invalid tools/list response: {error}")))?;
+        Ok(result.tools)
+    }
+
     /// Execute a tool on a specific server
     pub async fn call_tool(
         &self,

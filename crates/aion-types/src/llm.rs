@@ -25,9 +25,20 @@ pub enum ThinkingConfig {
 
 /// Streaming events from the LLM
 #[derive(Debug, Clone)]
+pub struct InvalidToolInput {
+    pub id: ToolUseId,
+    pub name: String,
+    pub line: usize,
+    pub column: usize,
+}
+
+/// Streaming events from the LLM.
+#[derive(Debug, Clone)]
 pub enum LlmEvent {
     /// Incremental text output
     TextDelta(String),
+    /// A complete call whose arguments could not be decoded. Never executable.
+    InvalidToolInput(InvalidToolInput),
     /// Complete tool call (after accumulating streaming deltas)
     ToolUse {
         id: ToolUseId,

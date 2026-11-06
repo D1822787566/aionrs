@@ -20,7 +20,7 @@ pub(crate) enum TurnOutcome {
 
 impl TurnOutcome {
     pub(crate) fn from_stream(outcome: StreamOutcome) -> Self {
-        if !outcome.tool_calls.is_empty() {
+        if !outcome.tool_calls.is_empty() || !outcome.invalid_tool_inputs.is_empty() {
             return Self::ToolRound(outcome);
         }
 
@@ -231,11 +231,27 @@ impl TurnGuards {
 
     /// Fold one tool round into the breakers and return the loop action. Must
     /// be called once per tool round, after the results are recorded.
+    #[cfg(test)]
     pub(crate) fn after_tool_round(
         &mut self,
         tool_call_malformed_fingerprint: Option<ToolCallMalformedFingerprint>,
         tool_call_failure_fingerprint: Option<ToolCallFailureFingerprint>,
         all_tool_results_error: bool,
+    ) -> TurnGuardAction {
+        self.after_tool_round_with_preserve(
+            tool_call_malformed_fingerprint,
+            tool_call_failure_fingerprint,
+            all_tool_results_error,
+            false,
+        )
+    }
+
+    pub(crate) fn after_tool_round_with_preserve(
+        &mut self,
+        tool_call_malformed_fingerprint: Option<ToolCallMalformedFingerprint>,
+        tool_call_failure_fingerprint: Option<ToolCallFailureFingerprint>,
+        all_tool_results_error: bool,
+        preserve_failure_state: bool,
     ) -> TurnGuardAction {
         let malformed_count = self.tool_call_malformed.observe(tool_call_malformed_fingerprint);
         if self.tool_call_malformed.is_limit_exceeded() {
@@ -251,9 +267,17 @@ impl TurnGuards {
             });
         }
 
-        let tool_call_failure_count = self.tool_call_failures.observe(tool_call_failure_fingerprint.clone());
+        let tool_call_failure_count = if preserve_failure_state {
+            self.tool_call_failures.count()
+        } else {
+            self.tool_call_failures.observe(tool_call_failure_fingerprint.clone())
+        };
         let all_error_round_count = self.all_error_tool_rounds.observe(all_tool_results_error);
-        let cycle = self.tool_call_cycles.observe(tool_call_failure_fingerprint);
+        let cycle = if preserve_failure_state {
+            None
+        } else {
+            self.tool_call_cycles.observe(tool_call_failure_fingerprint)
+        };
         if cycle.is_none() {
             self.tool_call_cycle_warning_emitted = false;
         }

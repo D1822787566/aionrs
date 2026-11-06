@@ -42,12 +42,14 @@ impl Tool for SpawnTool {
     fn input_schema(&self) -> JsonSchema {
         json!({
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "tasks": {
                     "type": "array",
                     "description": "List of tasks for sub-agents to execute in parallel",
                     "items": {
                         "type": "object",
+                        "additionalProperties": false,
                         "properties": {
                             "name": {
                                 "type": "string",
@@ -68,10 +70,6 @@ impl Tool for SpawnTool {
 
     fn is_concurrency_safe(&self, _input: &Value) -> bool {
         false // manages its own concurrency
-    }
-
-    fn is_deferred(&self) -> bool {
-        true
     }
 
     async fn execute(&self, input: Value) -> ToolResult {

@@ -20,9 +20,12 @@ The agent includes a core local tool suite and agent-level helpers. The LLM auto
 
 Read file contents with line numbers, similar to `cat -n`.
 
-- Supports `offset` and `limit` parameters for reading file slices
-- Auto-detects binary files
-- Output format: line-numbered text
+- `offset` is a zero-based line index; `limit` caps the number of lines.
+- Results use bounded chunks (about 8,000 bytes). `[READ_TRUNCATED]` gives `next_offset` and `total_lines`; pass that offset to continue.
+- An oversized single line switches to raw UTF-8 bytes and reports `next_byte_offset`. Continue with `byte_offset`, optionally `byte_limit` (4–8,000 bytes); do not mix byte and line parameters.
+- Byte mode preserves CRLF, blank lines, and final newlines for exact UTF-8 reconstruction. Invalid UTF-8 files or byte boundaries return errors. Read output skips whitespace/TOON transformations and still obeys the global tool-result limit.
+- Binary files are detected automatically.
+- Line mode formats each line as a one-based line number, a tab, and the line text.
 
 ## Write
 

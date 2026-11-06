@@ -1,4 +1,5 @@
 use super::*;
+use aion_types::message::ContentBlock;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -85,6 +86,21 @@ mod tests {
         let result = tool.execute(json!({ "skill": "greet", "args": "world" })).await;
         assert!(!result.is_error);
         assert_eq!(result.content, "Hello world!");
+    }
+
+    #[tokio::test]
+    async fn large_skill_uses_follow_up_context_without_truncating_summary() {
+        let body = "instruction ".repeat(2_000);
+        let tool = tool_with(vec![make_skill("large", &body)]);
+        let output = tool.execute_with_follow_up(json!({ "skill": "large" })).await;
+
+        assert!(!output.result.is_error);
+        assert!(output.result.content.contains("skill_loaded"));
+        assert!(output.result.content.len() < 1_000);
+        let ContentBlock::Text { text } = &output.follow_up_blocks[0] else {
+            panic!("expected loaded skill text")
+        };
+        assert!(text.contains(&body));
     }
 
     #[tokio::test]

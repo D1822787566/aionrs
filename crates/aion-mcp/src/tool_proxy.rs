@@ -85,6 +85,10 @@ impl Tool for McpToolProxy {
         }
     }
 
+    fn mcp_origin(&self) -> Option<(&str, &str)> {
+        Some((&self.server_name, &self.tool_name))
+    }
+
     fn category(&self) -> ToolCategory {
         ToolCategory::Mcp
     }

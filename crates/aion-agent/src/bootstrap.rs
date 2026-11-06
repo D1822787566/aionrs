@@ -28,6 +28,7 @@ use tracing::info;
 use crate::context::{SystemPromptCache, build_system_prompt_with_shell_and_tool_policy};
 use crate::context_usage::PromptUsage;
 use crate::engine::AgentEngine;
+use crate::host_skills::{HostSkillSource, HostedSkillTool};
 use crate::output::OutputSink;
 use crate::plan::tools::{EnterPlanModeTool, ExitPlanModeTool};
 use crate::session::Session;
@@ -64,6 +65,7 @@ pub struct AgentBootstrap {
     workspace: PathBuf,
     extra_skill_dirs: Vec<PathBuf>,
     isolate_skill_dirs: bool,
+    host_skills: Option<Arc<dyn HostSkillSource>>,
 
     // Output integration.
     output: Arc<dyn OutputSink>,
@@ -106,6 +108,7 @@ impl AgentBootstrap {
             workspace: PathBuf::from(workspace.into()),
             extra_skill_dirs: Vec::new(),
             isolate_skill_dirs: false,
+            host_skills: None,
             output,
             provider: None,
             resume_session: None,
@@ -151,6 +154,12 @@ impl AgentBootstrap {
     pub fn isolated_skill_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
         self.extra_skill_dirs = dirs;
         self.isolate_skill_dirs = true;
+        self
+    }
+
+    /// Use a host's conversation-scoped read-only skill source instead of filesystem discovery.
+    pub fn host_skills(mut self, source: Arc<dyn HostSkillSource>) -> Self {
+        self.host_skills = Some(source);
         self
     }
 
@@ -281,13 +290,16 @@ impl AgentBootstrap {
     }
 
     async fn load_skills(&self, workspace: &Path, mcp_manager: Option<&McpManager>) -> Vec<SkillMetadata> {
+        if self.host_skills.is_some() {
+            return Vec::new();
+        }
         load_all_skills(workspace, &self.extra_skill_dirs, self.isolate_skill_dirs, mcp_manager).await
     }
 
     fn configure_system_prompt(&mut self, environment: &BootstrapEnvironment, skills: &[SkillMetadata]) -> PromptUsage {
         let mut prompt_cache = SystemPromptCache::new();
         let workspace = self.workspace.to_string_lossy();
-        let system_prompt = build_system_prompt_with_shell_and_tool_policy(
+        let mut system_prompt = build_system_prompt_with_shell_and_tool_policy(
             &mut prompt_cache,
             self.config.system_prompt.as_deref(),
             &workspace,
@@ -301,7 +313,18 @@ impl AgentBootstrap {
             &self.tool_policy,
         );
         let memory_prompt = prompt_cache.sections.get("memory").map(String::as_str);
-        let skills_prompt = prompt_cache.sections.get("skills").map(String::as_str);
+        let hosted = self
+            .host_skills
+            .as_ref()
+            .filter(|_| self.tool_policy.allows("Skill"))
+            .map(|source| HostedSkillTool::new(source.clone(), &self.config.tools.skills.deny));
+        let hosted_prompt = hosted.as_ref().map(HostedSkillTool::index_prompt);
+        if let Some(prompt) = &hosted_prompt {
+            system_prompt.push_str(&format!("\n\n{prompt}"));
+        }
+        let skills_prompt = hosted_prompt
+            .as_deref()
+            .or_else(|| prompt_cache.sections.get("skills").map(String::as_str));
         let memory_files = if memory_prompt.is_some() {
             environment
                 .memory_dir
@@ -314,11 +337,14 @@ impl AgentBootstrap {
         } else {
             Vec::new()
         };
-        let visible_skills = skills
+        let mut visible_skills: Vec<String> = skills
             .iter()
             .filter(|skill| self.tool_policy.allows("Skill") && !skill.disable_model_invocation)
             .map(|skill| skill.name.clone())
             .collect();
+        if let Some(tool) = hosted {
+            visible_skills.extend(tool.available().into_iter().map(|skill| skill.name));
+        }
         let prompt_usage = PromptUsage::from_sections(
             &system_prompt,
             memory_prompt,
@@ -342,15 +368,37 @@ impl AgentBootstrap {
             self.config.tools.skills.allow.clone(),
             self.config.tools.auto_approve,
         );
-        registry.register(Box::new(SkillTool::new(
-            Arc::new(skills),
-            self.workspace.to_path_buf(),
-            skill_checker,
-        )));
+        if let Some(source) = &self.host_skills {
+            registry.register(Box::new(HostedSkillTool::new(
+                source.clone(),
+                &self.config.tools.skills.deny,
+            )));
+        } else {
+            registry.register(Box::new(SkillTool::new(
+                Arc::new(skills),
+                self.workspace.to_path_buf(),
+                skill_checker,
+            )));
+        }
 
         let spawner = AgentSpawner::new_with_env(
             Arc::clone(provider),
-            self.config.clone(),
+            {
+                let mut config = self.config.clone();
+                if self.host_skills.is_some() {
+                    if let Some(prompt) = &mut config.system_prompt
+                        && let Some(index) = prompt.rfind(
+                            "\n\n## Available Skills\nUse Skill to read these conversation-selected instructions.",
+                        )
+                    {
+                        prompt.truncate(index);
+                    }
+                    if let Some(prompt) = &mut config.system_prompt {
+                        prompt.push_str("\nThis basic child has no Skill tool. Use the host skills CLI through permitted tools to read selected skill instructions if needed.");
+                    }
+                }
+                config
+            },
             workspace.to_path_buf(),
             self.runtime_env.clone(),
             self.tool_policy.clone(),

@@ -59,7 +59,9 @@ mod tests {
         let result = tool.execute(input).await;
 
         assert!(!result.is_error);
-        let lines: Vec<&str> = result.content.lines().collect();
+        let (body, marker) = result.content.split_once("\n\n[READ_TRUNCATED]").unwrap();
+        assert!(marker.contains("next_offset=5"));
+        let lines: Vec<&str> = body.lines().collect();
         assert_eq!(lines.len(), 3);
         assert!(lines[0].contains("3\tline 3"));
         assert!(lines[1].contains("4\tline 4"));
@@ -106,9 +108,79 @@ mod tests {
 
         assert!(!result.is_error);
         let lines: Vec<&str> = result.content.lines().collect();
+        assert!(!result.content.contains("[READ_TRUNCATED]"));
         assert_eq!(lines.len(), 200);
         assert!(lines[0].contains("1\tline number 1"));
         assert!(lines[199].contains("200\tline number 200"));
+    }
+
+    #[tokio::test]
+    async fn large_read_reports_a_continuation_offset() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("large-continuation.txt");
+        let mut file = std::fs::File::create(&file_path).unwrap();
+        for i in 1..=2_000 {
+            writeln!(file, "line number {i} with a little extra content").unwrap();
+        }
+        drop(file);
+
+        let result = ReadTool::new(None)
+            .execute(json!({ "file_path": file_path.to_str().unwrap() }))
+            .await;
+        assert!(!result.is_error);
+        assert!(result.content.len() <= 8_000 + 120);
+        assert!(result.content.contains("[READ_TRUNCATED]"));
+        assert!(result.content.contains("next_offset="));
+        assert!(result.content.contains("total_lines=2000"));
+    }
+
+    #[tokio::test]
+    async fn long_line_automatically_switches_to_byte_continuation() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("long.txt");
+        let body = format!("{}\r\ntail\r\n", "中文🙂".repeat(3_000));
+        std::fs::write(&file, &body).unwrap();
+        let tool = ReadTool::new(Some(make_cache()));
+        let first = tool.execute(json!({"file_path":file})).await;
+        assert!(!first.is_error);
+        let (prefix, marker) = first.content.rsplit_once("\n\n[READ_TRUNCATED]").unwrap();
+        assert!(body.starts_with(prefix));
+        let offset: usize = marker
+            .split_whitespace()
+            .find_map(|v| v.strip_prefix("next_byte_offset="))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(offset > 0);
+        let next = tool.execute(json!({"file_path":file,"byte_offset":offset})).await;
+        assert!(!next.is_error);
+        assert!(next.content.starts_with(&body[offset..offset + 10]));
+        assert!(!next.content.contains(FILE_UNCHANGED_STUB));
+    }
+
+    #[tokio::test]
+    async fn byte_ranges_reject_invalid_utf8_boundaries_and_mixed_units() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("text.txt");
+        std::fs::write(&file, "中文").unwrap();
+        let tool = ReadTool::new(None);
+        for range in [
+            json!({"byte_offset":1}),
+            json!({"byte_offset":100}),
+            json!({"byte_offset":0,"byte_limit":1}),
+            json!({"byte_offset":0,"offset":0}),
+            json!({"byte_limit":4}),
+        ] {
+            let mut input = range;
+            input["file_path"] = json!(file);
+            assert!(tool.execute(input).await.is_error);
+        }
+        assert!(
+            tool.execute(json!({"file_path":file,"offset":u64::MAX}))
+                .await
+                .content
+                .is_empty()
+        );
     }
 
     // -- Dedup tests (with cache) --

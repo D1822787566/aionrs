@@ -1241,6 +1241,24 @@ mod tests_compact {
         ));
     }
 
+    #[test]
+    fn skill_follow_up_is_counted_before_threshold_check() {
+        let mut engine = make_compact_engine(CompactConfig::default(), CompactState::new(), vec![]);
+        engine.record_turn_usage(&TokenUsage {
+            input_tokens: 500,
+            output_tokens: 50,
+            ..Default::default()
+        });
+        engine.record_tool_context_estimate(
+            &[ContentBlock::Text { text: "e".repeat(400) }],
+            &[ContentBlock::Text {
+                text: "s".repeat(40_000),
+            }],
+        );
+        assert_eq!(engine.context_status().context_usage, 10_650);
+        assert_eq!(engine.compact_state.last_input_tokens, 10_650);
+    }
+
     // -- Emergency check fires when at limit --
 
     #[tokio::test]
@@ -2707,6 +2725,7 @@ mod tests_loop_helpers {
             thinking_signature: None,
             provider_items: Vec::new(),
             tool_calls,
+            invalid_tool_inputs: Vec::new(),
             stop_reason,
             usage: TokenUsage::default(),
         }
