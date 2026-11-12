@@ -30,6 +30,22 @@ mod phase7_tests {
     }
 
     #[test]
+    fn helper_runtime_registers_structured_aion_operation() {
+        let registry = build_tool_registry(
+            &ToolPolicy::Unrestricted,
+            &std::env::temp_dir(),
+            &[("AIONUI_HELPER_BIN".into(), "aioncore".into())],
+        );
+        assert!(registry.get("AionOperation").is_some());
+    }
+
+    #[test]
+    fn missing_helper_runtime_does_not_advertise_structured_aion_operation() {
+        let registry = build_tool_registry(&ToolPolicy::Unrestricted, &std::env::temp_dir(), &[]);
+        assert!(registry.get("AionOperation").is_none());
+    }
+
+    #[test]
     fn fork_overrides_can_only_narrow_parent_policy() {
         let parent = ToolPolicy::allow_only(["Read", "Grep", "Spawn"]);
         let allowed_tools = vec!["Read".to_string(), "ExecCommand".to_string()];

@@ -1,3 +1,4 @@
+use aion_tools::aion_operation_contract::OperationContract;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -5,6 +6,7 @@ use async_trait::async_trait;
 
 use aion_config::config::Config;
 use aion_providers::LlmProvider;
+use aion_tools::aion_operation::AionOperationTool;
 use aion_tools::edit::EditTool;
 use aion_tools::exec_command::ExecCommandTool;
 use aion_tools::glob::GlobTool;
@@ -36,6 +38,7 @@ pub struct AgentSpawner {
     base_config: Config,
     cwd: PathBuf,
     runtime_env: Vec<(String, String)>,
+    operation_contract: Option<OperationContract>,
     tool_policy: ToolPolicy,
 }
 
@@ -56,8 +59,14 @@ impl AgentSpawner {
             base_config: config,
             cwd,
             runtime_env,
+            operation_contract: None,
             tool_policy,
         }
+    }
+
+    pub fn with_operation_contract(mut self, contract: Option<OperationContract>) -> Self {
+        self.operation_contract = contract;
+        self
     }
 
     /// Spawn a single sub-agent and wait for result.
@@ -74,7 +83,12 @@ impl AgentSpawner {
         tracing::info!(target: "aion_agent", cwd = %self.cwd.display(), "sub-agent spawned with workspace cwd");
 
         let child_policy = effective_child_tool_policy(&self.tool_policy, &[]);
-        let tools = build_tool_registry(&child_policy, &self.cwd, &self.runtime_env);
+        let tools = build_tool_registry_with_contract(
+            &child_policy,
+            &self.cwd,
+            &self.runtime_env,
+            self.operation_contract.clone(),
+        );
         let output: Arc<dyn OutputSink> = Arc::new(NullSink);
         let mut engine = AgentEngine::new_with_provider_and_env(
             self.provider.clone(),
@@ -136,6 +150,7 @@ impl AgentSpawner {
             base_config: self.base_config.clone(),
             cwd: self.cwd.clone(),
             runtime_env: self.runtime_env.clone(),
+            operation_contract: self.operation_contract.clone(),
             tool_policy: self.tool_policy.clone(),
         }
     }
@@ -157,7 +172,12 @@ impl Spawner for AgentSpawner {
         }
 
         let child_policy = effective_child_tool_policy(&self.tool_policy, &overrides.allowed_tools);
-        let tools = build_tool_registry(&child_policy, &self.cwd, &self.runtime_env);
+        let tools = build_tool_registry_with_contract(
+            &child_policy,
+            &self.cwd,
+            &self.runtime_env,
+            self.operation_contract.clone(),
+        );
         let output: Arc<dyn OutputSink> = Arc::new(NullSink);
         let mut engine = AgentEngine::new_with_provider_and_env(
             self.provider.clone(),
@@ -202,7 +222,17 @@ fn effective_child_tool_policy(parent: &ToolPolicy, allowed_tools: &[String]) ->
     )
 }
 
+#[cfg(test)]
 fn build_tool_registry(policy: &ToolPolicy, cwd: &Path, runtime_env: &[(String, String)]) -> ToolRegistry {
+    build_tool_registry_with_contract(policy, cwd, runtime_env, None)
+}
+
+fn build_tool_registry_with_contract(
+    policy: &ToolPolicy,
+    cwd: &Path,
+    runtime_env: &[(String, String)],
+    contract: Option<OperationContract>,
+) -> ToolRegistry {
     let all_tools: Vec<(&str, Box<dyn aion_tools::Tool>)> = vec![
         ("Read", Box::new(ReadTool::new(None))),
         ("Write", Box::new(WriteTool::new(None))),
@@ -220,6 +250,11 @@ fn build_tool_registry(policy: &ToolPolicy, cwd: &Path, runtime_env: &[(String, 
         if policy.allows(name) {
             registry.register(tool);
         }
+    }
+    if policy.allows("AionOperation")
+        && let Some(tool) = AionOperationTool::from_runtime_env(runtime_env)
+    {
+        registry.register(Box::new(tool.with_contract(contract)));
     }
     registry
 }

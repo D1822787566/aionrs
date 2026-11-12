@@ -1,3 +1,4 @@
+use aion_tools::aion_operation_contract::OperationContract;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -12,6 +13,7 @@ use aion_providers::{LlmProvider, create_provider};
 use aion_skills::loader::load_all_skills;
 use aion_skills::permissions::SkillPermissionChecker;
 use aion_skills::types::SkillMetadata;
+use aion_tools::aion_operation::AionOperationTool;
 use aion_tools::edit::EditTool;
 use aion_tools::exec_command::ExecCommandTool;
 use aion_tools::file_cache::FileStateCache;
@@ -74,6 +76,7 @@ pub struct AgentBootstrap {
     provider: Option<Arc<dyn LlmProvider>>,
     resume_session: Option<Session>,
     runtime_env: Vec<(String, String)>,
+    operation_contract: Option<OperationContract>,
     tool_policy: ToolPolicy,
 }
 
@@ -113,6 +116,7 @@ impl AgentBootstrap {
             provider: None,
             resume_session: None,
             runtime_env: Vec::new(),
+            operation_contract: None,
             tool_policy: ToolPolicy::default(),
         }
     }
@@ -132,6 +136,12 @@ impl AgentBootstrap {
     /// Inject process environment for tools/hooks/MCP subprocesses owned by this engine.
     pub fn runtime_env(mut self, runtime_env: Vec<(String, String)>) -> Self {
         self.runtime_env = runtime_env;
+        self
+    }
+
+    /// Inject the host's static operation contract independently of process environment.
+    pub fn operation_contract(mut self, value: serde_json::Value) -> Self {
+        self.operation_contract = Some(OperationContract::new(value));
         self
     }
 
@@ -239,6 +249,11 @@ impl AgentBootstrap {
         registry.register(Box::new(GrepTool::new(workspace_path.to_path_buf())));
         registry.register(Box::new(GlobTool::new(workspace_path.to_path_buf())));
         registry.register(Box::new(ViewImageTool::new()));
+        if self.tool_policy.allows("AionOperation")
+            && let Some(tool) = AionOperationTool::from_runtime_env(&self.runtime_env)
+        {
+            registry.register(Box::new(tool.with_contract(self.operation_contract.clone())));
+        }
 
         registry
     }
@@ -402,7 +417,7 @@ impl AgentBootstrap {
             workspace.to_path_buf(),
             self.runtime_env.clone(),
             self.tool_policy.clone(),
-        );
+        ).with_operation_contract(self.operation_contract.clone());
         registry.register(Box::new(SpawnTool::new(Arc::new(spawner))));
     }
 

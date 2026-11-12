@@ -16,6 +16,14 @@ pub enum AgentError {
     Provider(#[from] ProviderError),
     #[error("User aborted the session")]
     UserAborted,
+    #[error(
+        "Tool {tool} needs at least {minimum} output bytes; configured budget is {actual}. No tool in this batch was executed."
+    )]
+    ToolOutputBudget {
+        tool: String,
+        minimum: usize,
+        actual: usize,
+    },
     #[error("Context window nearly full ({input_tokens} tokens used, limit {limit})")]
     ContextTooLong { input_tokens: u64, limit: usize },
 }

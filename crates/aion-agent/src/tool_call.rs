@@ -173,6 +173,32 @@ pub(crate) fn invalid_tool_input_fingerprint(errors: &[InvalidToolInput]) -> Opt
     Some(ToolCallFailureFingerprint { calls })
 }
 
+pub(crate) fn metadata_only_round(calls: &[ContentBlock], results: &[ContentBlock]) -> bool {
+    !calls.is_empty()
+        && calls.len() == results.len()
+        && calls.iter().zip(results).all(|(call, result)| {
+            let (ContentBlock::ToolUse { name, input, .. }, ContentBlock::ToolResult { content, is_error, .. }) =
+                (call, result)
+            else {
+                return false;
+            };
+            if name == "ToolSearch" {
+                return !is_error;
+            }
+            if name != "AionOperation" {
+                return false;
+            }
+            match input["operation"].as_str() {
+                Some("operation.describe") => !is_error,
+                // A successful snapshot read inherits the original operation's
+                // failure flag; it still must not clear that operation's budget.
+                Some("result.read") => serde_json::from_str::<serde_json::Value>(content)
+                    .is_ok_and(|v| v["delivery"]["result_id"].is_string()),
+                _ => false,
+            }
+        })
+}
+
 /// Interleave synthetic malformed-call results with executed-tool results back
 /// into the original `tool_calls` order.
 ///
@@ -360,7 +386,6 @@ impl ToolCallAllErrorRoundTracker {
         self.limit
     }
 
-    #[cfg(test)]
     pub(crate) fn count(&self) -> usize {
         self.count
     }

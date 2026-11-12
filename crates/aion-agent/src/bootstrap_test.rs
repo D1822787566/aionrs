@@ -140,6 +140,15 @@ mod tests {
         assert_eq!(env.get("RUNTIME_ONLY").map(String::as_str), Some("1"));
     }
 
+    #[test]
+    fn helper_runtime_registers_structured_aion_operation() {
+        let output: Arc<dyn OutputSink> = Arc::new(NullSink);
+        let bootstrap = AgentBootstrap::new(test_config(), "/tmp", output)
+            .runtime_env(vec![("AIONUI_HELPER_BIN".to_owned(), "aioncore".to_owned())]);
+        let registry = bootstrap.build_builtin_registry(std::path::Path::new("/tmp"));
+        assert!(registry.get("AionOperation").is_some());
+    }
+
     #[tokio::test]
     async fn tool_search_snapshot_excludes_policy_denied_tools() {
         let output: Arc<dyn OutputSink> = Arc::new(NullSink);

@@ -272,7 +272,11 @@ impl TurnGuards {
         } else {
             self.tool_call_failures.observe(tool_call_failure_fingerprint.clone())
         };
-        let all_error_round_count = self.all_error_tool_rounds.observe(all_tool_results_error);
+        let all_error_round_count = if preserve_failure_state {
+            self.all_error_tool_rounds.count()
+        } else {
+            self.all_error_tool_rounds.observe(all_tool_results_error)
+        };
         let cycle = if preserve_failure_state {
             None
         } else {

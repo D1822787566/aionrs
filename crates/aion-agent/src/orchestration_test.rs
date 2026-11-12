@@ -5,6 +5,40 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[tokio::test]
+    async fn nondefault_budget_is_honored_after_structured_formatting() {
+        use aion_tools::aion_operation::AionOperationTool;
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(
+            AionOperationTool::from_runtime_env(&[("AIONUI_HELPER_BIN".into(), "missing-helper".into())]).unwrap(),
+        ));
+        let calls = [ContentBlock::ToolUse {
+            id: "budget".into(),
+            name: "AionOperation".into(),
+            input: json!({"operation":"config.context"}),
+            extra: None,
+        }];
+        for budget in [512, 1024, 2048] {
+            let output = execute_tool_calls_with_output_limit(
+                &registry,
+                &calls,
+                &Arc::new(Mutex::new(ToolConfirmer::new(true, vec![]))),
+                None,
+                aion_compact::CompactLevel::Full,
+                true,
+                budget,
+                u64::MAX,
+            )
+            .await
+            .unwrap();
+            let ContentBlock::ToolResult { content, .. } = &output.results[0] else {
+                panic!("missing result")
+            };
+            assert!(content.len() <= budget);
+            assert!(serde_json::from_str::<serde_json::Value>(content).is_ok());
+        }
+    }
+
     // -- truncate_display -----------------------------------------------------
 
     #[test]

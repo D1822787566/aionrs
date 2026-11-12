@@ -1,9 +1,10 @@
 use std::io::{Error, Result};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 
@@ -15,21 +16,37 @@ pub const DEFAULT_POST_PROCESS_DRAIN: Duration = Duration::from_millis(250);
 /// Runs one process and buffers its stdout/stderr while it is running.
 pub struct CommandRunner {
     command: Command,
+    stdin: Option<Vec<u8>>,
     timeout: Duration,
     post_process_drain: Duration,
+    started: Option<Arc<AtomicBool>>,
 }
 
 impl CommandRunner {
     pub fn new(command: Command) -> Self {
         Self {
             command,
+            stdin: None,
             timeout: DEFAULT_TIMEOUT,
             post_process_drain: DEFAULT_POST_PROCESS_DRAIN,
+            started: None,
         }
+    }
+
+    /// Provide bytes that should be written to the child process stdin.
+    pub fn stdin_bytes(mut self, input: impl Into<Vec<u8>>) -> Self {
+        self.stdin = Some(input.into());
+        self
     }
 
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Let callers distinguish a spawn failure from an error after the child started.
+    pub fn started_flag(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.started = Some(flag);
         self
     }
 
@@ -39,18 +56,26 @@ impl CommandRunner {
     }
 
     pub async fn run(mut self) -> Result<CommandResult> {
+        if self.stdin.is_some() {
+            self.command.stdin(Stdio::piped());
+        }
         self.command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         ChildContainment::configure(&mut self.command);
 
+        if let Some(flag) = &self.started {
+            flag.store(false, Ordering::Release);
+        }
         let mut child = self.command.spawn()?;
+        if let Some(flag) = &self.started {
+            flag.store(true, Ordering::Release);
+        }
         let child_id = child.id();
         let containment = ChildContainment::attach(&mut child)?;
         let stdout = Arc::new(Mutex::new(Vec::new()));
         let stderr = Arc::new(Mutex::new(Vec::new()));
-
         let stdout_reader = child
             .stdout
             .take()
@@ -59,6 +84,12 @@ impl CommandRunner {
             .stderr
             .take()
             .map(|reader| read_stream(reader, Arc::clone(&stderr)));
+        if let Some(input) = self.stdin.take()
+            && let Some(mut stdin) = child.stdin.take()
+        {
+            stdin.write_all(&input).await?;
+            stdin.shutdown().await?;
+        }
 
         match tokio::time::timeout(self.timeout, child.wait()).await {
             Ok(status) => {

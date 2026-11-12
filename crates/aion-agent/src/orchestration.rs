@@ -11,7 +11,6 @@ use aion_types::message::ContentBlock;
 use aion_types::skill_types::ContextModifier;
 use aion_types::tool::ToolResult;
 
-use aion_tools::validation::format_tool_input_error;
 use aion_tools::{registry::ToolRegistry, truncate_utf8};
 
 /// The combined output of a tool execution batch: protocol content blocks
@@ -26,10 +25,10 @@ fn validation_failure(registry: &ToolRegistry, call: &ContentBlock) -> Option<Co
     let ContentBlock::ToolUse { id, name, input, .. } = call else {
         return None;
     };
-    let errors = registry.get(name)?.validate_input(input).err()?;
+    let error = registry.get(name)?.preflight(input).err()?;
     Some(ContentBlock::ToolResult {
         tool_use_id: id.clone(),
-        content: format_tool_input_error(name, &errors),
+        content: error.content,
         is_error: true,
     })
 }
@@ -80,6 +79,7 @@ pub(crate) async fn execute_tool_calls_with_output_limit(
     tool_output_max_bytes: usize,
     skill_context_budget: u64,
 ) -> Result<ToolCallOutcome, ExecutionControl> {
+    check_output_budgets(registry, tool_calls, tool_output_max_bytes)?;
     let skill_context_budget = Mutex::new(skill_context_budget);
     let mut results = Vec::new();
     let mut modifiers = Vec::new();
@@ -170,7 +170,7 @@ pub(crate) async fn execute_tool_calls_with_output_limit(
         }
     }
 
-    truncate_tool_result_blocks(&mut results, tool_output_max_bytes);
+    finalize_tool_result_blocks(registry, tool_calls, &mut results, tool_output_max_bytes);
 
     Ok(ToolCallOutcome {
         results,
@@ -179,10 +179,35 @@ pub(crate) async fn execute_tool_calls_with_output_limit(
     })
 }
 
-/// Signal that the user wants to abort
+/// Execution stopped by the user or by an invalid output-budget configuration.
 #[derive(Debug)]
 pub enum ExecutionControl {
     Quit,
+    OutputBudgetTooSmall {
+        tool: String,
+        minimum: usize,
+        actual: usize,
+    },
+}
+
+pub(crate) fn check_output_budgets(
+    registry: &ToolRegistry,
+    calls: &[ContentBlock],
+    budget: usize,
+) -> Result<(), ExecutionControl> {
+    for call in calls {
+        if let ContentBlock::ToolUse { name, .. } = call
+            && let Some(tool) = registry.get(name)
+            && budget.min(tool.max_result_size()) < tool.minimum_result_size()
+        {
+            return Err(ExecutionControl::OutputBudgetTooSmall {
+                tool: name.clone(),
+                minimum: tool.minimum_result_size(),
+                actual: budget.min(tool.max_result_size()),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Confirm a single tool call. Returns Ok(Some(result)) if denied, Ok(None) if approved, Err if quit.
@@ -267,12 +292,15 @@ async fn execute_single(
                 r.content.clone()
             };
             // Read ranges must preserve whitespace and line endings for exact continuation.
-            let content = if name == "Read" {
+            let structured = tool.format_result(input, &r, max_size.min(tool_output_max_bytes));
+            let content = if let Some(ref formatted) = structured {
+                formatted.content.clone()
+            } else if name == "Read" {
                 error_content
             } else {
                 aion_compact::compact_output(&error_content, compaction_level)
             };
-            let content = if toon_enabled && name != "Read" {
+            let content = if structured.is_none() && toon_enabled && name != "Read" {
                 aion_compact::compact_output_toon(&content)
             } else {
                 content
@@ -293,7 +321,7 @@ async fn execute_single(
             (
                 ToolResult {
                     content,
-                    is_error: r.is_error,
+                    is_error: structured.as_ref().map_or(r.is_error, |r| r.is_error),
                 },
                 modifier,
                 follow_up_blocks,
@@ -377,6 +405,7 @@ pub(crate) async fn execute_tool_calls_with_approval_and_output_limit(
     tool_output_max_bytes: usize,
     skill_context_budget: u64,
 ) -> Result<ToolCallOutcome, ExecutionControl> {
+    check_output_budgets(registry, tool_calls, tool_output_max_bytes)?;
     let skill_context_budget = Mutex::new(skill_context_budget);
     let mut results = Vec::new();
     let mut modifiers = Vec::new();
@@ -492,7 +521,7 @@ pub(crate) async fn execute_tool_calls_with_approval_and_output_limit(
         follow_up_blocks.extend(blocks);
     }
 
-    truncate_tool_result_blocks(&mut results, tool_output_max_bytes);
+    finalize_tool_result_blocks(registry, tool_calls, &mut results, tool_output_max_bytes);
 
     Ok(ToolCallOutcome {
         results,
@@ -555,8 +584,37 @@ fn maybe_append_deferred_hint(original_error: &str, schema: serde_json::Value, i
     )
 }
 
-fn truncate_tool_result_blocks(results: &mut [ContentBlock], max_bytes: usize) {
+pub(crate) fn finalize_tool_result_blocks(
+    registry: &ToolRegistry,
+    calls: &[ContentBlock],
+    results: &mut [ContentBlock],
+    max_bytes: usize,
+) {
     for result in results {
+        if let ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } = result
+            && let Some((tool, input)) = calls.iter().find_map(|call| match call {
+                ContentBlock::ToolUse { id, name, input, .. } if id == tool_use_id => {
+                    registry.get(name).map(|tool| (tool, input))
+                }
+                _ => None,
+            })
+            && let Some(formatted) = tool.format_result(
+                input,
+                &ToolResult {
+                    content: content.clone(),
+                    is_error: *is_error,
+                },
+                max_bytes.min(tool.max_result_size()),
+            )
+        {
+            *content = formatted.content;
+            *is_error = formatted.is_error;
+            continue;
+        }
         if let ContentBlock::ToolResult { content, .. } = result
             && content.len() > max_bytes
         {

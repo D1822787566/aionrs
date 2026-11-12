@@ -64,6 +64,13 @@ impl Tool for ExecCommandTool {
          - Write files: use Write (not echo or cat with heredoc)\n\n\
          # Instructions\n\
          - Use absolute paths to avoid working directory confusion.\n\
+         - The selected shell already executes `cmd` as a script. For ordinary PowerShell commands, \
+         write the script directly; do not wrap it in another `powershell -Command` or `pwsh -Command`. \
+         Use the `shell` parameter to select a different shell. Start a nested shell only when \
+         an independent child process is intentional; double-quoted PowerShell strings expand \
+         variables in the outer shell before the child receives them.\n\
+         - After a failure, use the exit code and stderr to correct the command. Before retrying, \
+         check whether any earlier steps already succeeded to avoid repeating side effects.\n\
          - When issuing multiple independent commands, make parallel tool calls \
          instead of chaining them. For dependent commands, use syntax supported by the \
          current shell. In Windows PowerShell 5.1, use `; if ($?) { ... }` instead of `&&`.\n\

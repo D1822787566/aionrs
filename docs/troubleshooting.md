@@ -56,11 +56,6 @@ Command timed out after 120000ms
 
 A ExecCommand tool command exceeded the timeout. Increase the timeout via the tool's `timeout` parameter.
 
-## ripgrep Not Installed
+## Grep Search Runtime
 
-The Grep tool automatically falls back to system `grep`. For better search performance:
-
-```bash
-brew install ripgrep  # macOS
-sudo apt install ripgrep  # Debian/Ubuntu
-```
+The Grep tool runs in-process and does not require a separately installed `rg`, `grep`, or `findstr` executable.

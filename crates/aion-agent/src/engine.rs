@@ -16,7 +16,8 @@ use crate::context_usage::{
 };
 use crate::error::AgentError;
 use crate::orchestration::{
-    ExecutionControl, execute_tool_calls_with_approval_and_output_limit, execute_tool_calls_with_output_limit,
+    ExecutionControl, check_output_budgets, execute_tool_calls_with_approval_and_output_limit,
+    execute_tool_calls_with_output_limit, finalize_tool_result_blocks,
 };
 use crate::output::OutputSink;
 use crate::plan::prompt::plan_mode_instructions;
@@ -28,7 +29,7 @@ use crate::tool_call::merge_tool_results;
 use crate::tool_call::{
     DEFAULT_MAX_TOOL_CALL_FAILURE, DEFAULT_MAX_TOOL_CALL_MALFORMED, ToolCallFailureFingerprint,
     ToolCallMalformedFingerprint, invalid_tool_input_fingerprint, merge_tool_results_with_validation,
-    tool_call_failure_fingerprint, tool_call_malformed_fingerprint, tool_call_malformed_reason,
+    metadata_only_round, tool_call_failure_fingerprint, tool_call_malformed_fingerprint, tool_call_malformed_reason,
 };
 use crate::tool_policy::ToolPolicy;
 use crate::tool_recovery::{
@@ -46,7 +47,6 @@ use aion_protocol::events::{OutputType, ProtocolEvent, ToolCategory, ToolStatus}
 use aion_protocol::writer::ProtocolEmitter;
 use aion_providers::provider::{LlmProvider, create_provider};
 use aion_tools::registry::ToolRegistry;
-use aion_tools::validation::format_tool_input_error;
 use aion_types::llm::{LlmEvent, LlmRequest, ThinkingConfig};
 use aion_types::message::{ContentBlock, ImageInputCapability, Message, Role, StopReason, TokenUsage};
 use aion_types::skill_types::{ContextModifier, PlanModeTransition, effort_to_string};
@@ -824,8 +824,8 @@ impl AgentEngine {
                 };
                 self.tools
                     .get(name)
-                    .and_then(|tool| tool.validate_input(input).err())
-                    .map(|errors| format_tool_input_error(name, &errors))
+                    .and_then(|tool| tool.preflight(input).err())
+                    .map(|error| error.content)
             })
             .collect();
         let executable_tool_calls: Vec<_> = tool_calls
@@ -852,6 +852,11 @@ impl AgentEngine {
             .saturating_sub(result_reserve)
             .saturating_sub(256);
 
+        if let Err(ExecutionControl::OutputBudgetTooSmall { tool, minimum, actual }) =
+            check_output_budgets(&self.tools, tool_calls, self.compact_config.tool_output_max_bytes)
+        {
+            return Err(AgentError::ToolOutputBudget { tool, minimum, actual });
+        }
         let (executable_results, executable_modifiers, follow_up_blocks) = if executable_tool_calls.is_empty() {
             (Vec::new(), Vec::new(), Vec::new())
         } else if let Some(ref approval_mgr) = self.approval_manager {
@@ -882,6 +887,10 @@ impl AgentEngine {
                     self.save_session();
                     return Err(AgentError::UserAborted);
                 }
+                Err(ExecutionControl::OutputBudgetTooSmall { tool, minimum, actual }) => {
+                    self.save_session();
+                    return Err(AgentError::ToolOutputBudget { tool, minimum, actual });
+                }
             }
         } else {
             // Terminal mode: use interactive confirmation
@@ -902,16 +911,26 @@ impl AgentEngine {
                     self.save_session();
                     return Err(AgentError::UserAborted);
                 }
+                Err(ExecutionControl::OutputBudgetTooSmall { tool, minimum, actual }) => {
+                    self.save_session();
+                    return Err(AgentError::ToolOutputBudget { tool, minimum, actual });
+                }
             }
         };
 
-        let (tool_results, tool_modifiers) = merge_tool_results_with_validation(
+        let (mut tool_results, tool_modifiers) = merge_tool_results_with_validation(
             tool_calls,
             &tool_call_malformed_reasons,
             &policy_denied_tool_names,
             &validation_errors,
             executable_results,
             executable_modifiers,
+        );
+        finalize_tool_result_blocks(
+            &self.tools,
+            tool_calls,
+            &mut tool_results,
+            self.compact_config.tool_output_max_bytes,
         );
         self.emit_validation_events(tool_calls, &validation_errors);
 
@@ -925,13 +944,13 @@ impl AgentEngine {
             })
             .map(|(((call, _), validation_error), _)| {
                 if let Some(validation_error) = validation_error {
-                    let ContentBlock::ToolUse { id, name, .. } = call else {
+                    let ContentBlock::ToolUse { id, name, input, .. } = call else {
                         return call.clone();
                     };
                     return ContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
-                        input: serde_json::json!({"validation_error": validation_error}),
+                        input: serde_json::json!({"operation": input.get("operation"), "validation_error": validation_error}),
                         extra: None,
                     };
                 }
@@ -943,12 +962,7 @@ impl AgentEngine {
             && tool_results
                 .iter()
                 .all(|result| matches!(result, ContentBlock::ToolResult { is_error: true, .. }));
-        let tool_round_preserves_failure_state = tool_calls
-            .iter()
-            .all(|call| matches!(call, ContentBlock::ToolUse { name, .. } if name == "ToolSearch"))
-            && tool_results
-                .iter()
-                .all(|result| matches!(result, ContentBlock::ToolResult { is_error: false, .. }));
+        let tool_round_preserves_failure_state = metadata_only_round(tool_calls, &tool_results);
 
         Ok(ToolRoundOutput {
             tool_results,

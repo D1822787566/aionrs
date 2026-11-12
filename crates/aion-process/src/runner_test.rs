@@ -9,6 +9,33 @@ mod tests {
     use super::CommandRunner;
 
     #[tokio::test]
+    async fn started_flag_distinguishes_spawn_failure_from_a_started_child() {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        assert!(
+            CommandRunner::new(Command::new("aion-fixture-missing-executable"))
+                .started_flag(flag.clone())
+                .run()
+                .await
+                .is_err()
+        );
+        assert!(!flag.load(std::sync::atomic::Ordering::Acquire));
+        CommandRunner::new(shell_command("exit 0"))
+            .started_flag(flag.clone())
+            .run()
+            .await
+            .unwrap();
+        assert!(flag.load(std::sync::atomic::Ordering::Acquire));
+        assert!(
+            CommandRunner::new(Command::new("aion-fixture-missing-executable"))
+                .started_flag(flag.clone())
+                .run()
+                .await
+                .is_err()
+        );
+        assert!(!flag.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
     async fn runner_preserves_stdout_emitted_before_timeout() {
         #[cfg(windows)]
         let script = "Write-Output runner_stdout_before_timeout; Start-Sleep -Seconds 5";
@@ -76,6 +103,27 @@ mod tests {
             "stderr was: {}",
             String::from_utf8_lossy(&result.stderr)
         );
+    }
+
+    #[tokio::test]
+    async fn runner_writes_configured_stdin_and_closes_it() {
+        #[cfg(windows)]
+        let command = {
+            let mut command = Command::new("cmd");
+            command.args(["/c", "more"]);
+            command
+        };
+        #[cfg(not(windows))]
+        let command = shell_command("cat");
+
+        let result = CommandRunner::new(command)
+            .stdin_bytes(br#"{"stdin":"ok"}"#.to_vec())
+            .run()
+            .await
+            .expect("runner should complete successfully");
+
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), r#"{"stdin":"ok"}"#);
     }
 
     #[cfg(not(windows))]

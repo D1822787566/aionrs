@@ -1,3 +1,4 @@
+pub mod aion_operation;
 pub mod edit;
 pub mod exec_command;
 pub mod file_cache;
@@ -12,3 +13,4 @@ pub mod view_image;
 pub mod write;
 
 pub use tool::{Tool, ToolExecutionOutput, truncate_utf8};
+pub mod aion_operation_contract;

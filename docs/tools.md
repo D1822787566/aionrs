@@ -11,6 +11,7 @@ The agent includes a core local tool suite and agent-level helpers. The LLM auto
 | **Grep** | Regex search file contents (via ripgrep) | Yes |
 | **Glob** | Find files by pattern matching | Yes |
 | **ViewImage** | Load a local JPEG, PNG, GIF, or WebP image for model inspection | Yes |
+| **AionOperation** | Call a whitelisted AionUi operation through the injected AionCore helper | No |
 | **Spawn** | Spawn sub-agents for parallel tasks | No |
 | **ToolSearch** | Load schemas for deferred tools | Yes |
 
@@ -49,11 +50,27 @@ Execute a shell command and return the result.
 - Default timeout: 120 seconds, max 600 seconds
 - Returns exit code, stdout, and stderr
 
+## AionOperation
+
+Call fixed AionUi operations without constructing a PowerShell command.
+
+- The `operation` field is a strict whitelist covering the configured AionUi, conversation, session, team, and skill operations.
+- Operation-specific arguments go in the `input` object and are passed as JSON to the AionCore helper.
+- State-changing operations require `confirm: true` and still pass through the normal tool approval flow.
+- If the host did not inject `AIONUI_HELPER_BIN`, the tool is not registered. Use `ExecCommand` for ordinary system commands.
+- Results use a normalized JSON envelope with `success`, `operation`, `data`, `error`, and `code` fields.
+- Final model-visible output is valid JSON within the effective tool-output byte budget, including errors and approval denials. Text compaction and TOON do not rewrite this structured output. A budget below 512 bytes stops the batch before any helper runs.
+- `delivery.complete` states whether the full original result was delivered. `has_more` and `next_offset` refer to the selected path, so `has_more: false` does not mean nested details were delivered. Lists show summaries; `$details` contains a JSON pointer to omitted content. MCP configuration and historical test status do not establish live availability in this session.
+- To retrieve details, use `operation: "result.read"` with `input: {"result_id": "...", "path": "/data/0/tools", "offset": 0, "limit": 20}`. This is a local read-only operation, not a helper command. The pointer can address the original envelope, including `/meta/before`, `/meta/after` and `/error`; an empty pointer selects its root.
+- Offsets count array items, object fields, or UTF-8 bytes for strings. Follow `next_offset`; concatenate string `data` fragments exactly. Text defaults to 4,096 bytes per page, arrays/objects to 20 entries; JSON escaping and envelope overhead can reduce the delivered page. The server reports the actual continuation position.
+- Continuations read an immutable result and never run the original helper again. Each tool instance retains at most 8 results, 8 MiB per result and 32 MiB total serialized size, for 30 minutes. Runtime restart, eviction and expiry return `aion_operation_result_expired`. Snapshots are not persisted or shared between runtimes.
+- Write receipts retain `delivery.execution_status: "succeeded"` after a successful helper result, even if details are summarized. Timeouts/readback failures can report `unknown`; they do not prove a write did not occur. Never repeat a write to retrieve its receipt: use `result.read`, or query resource state after expiry. An oversized result that cannot be retained explicitly reports `aion_operation_output_unavailable` while preserving execution status.
+
 ## Grep
 
 Search file contents with regular expressions.
 
-- Uses `rg` (ripgrep) when available, falls back to `grep -rn`
+- Runs in-process with the Rust regex engine and recursive ignore-aware walker; it does not require `rg`, `grep`, or `findstr`
 - Supports glob filtering and case-insensitive search
 - Results limited to 250 lines
 

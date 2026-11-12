@@ -6,6 +6,45 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn reading_a_failed_snapshot_preserves_the_original_failure_budget() {
+        let calls = [ContentBlock::ToolUse {
+            id: "read".into(),
+            name: "AionOperation".into(),
+            input: json!({"operation":"result.read","input":{"result_id":"fixture"}}),
+            extra: None,
+        }];
+        let failed_snapshot = [ContentBlock::ToolResult {
+            tool_use_id: "read".into(),
+            content: json!({"success":false,"delivery":{"result_id":"fixture","execution_status":"unknown"}})
+                .to_string(),
+            is_error: true,
+        }];
+        assert!(metadata_only_round(&calls, &failed_snapshot));
+        let expired = [ContentBlock::ToolResult {
+            tool_use_id: "read".into(),
+            content: json!({"success":false,"code":"aion_operation_result_expired"}).to_string(),
+            is_error: true,
+        }];
+        assert!(!metadata_only_round(&calls, &expired));
+        let mut guards = crate::turn::TurnGuards::new(None, 3, 20);
+        for index in 0..8 {
+            let action = guards.after_tool_round_with_preserve(
+                None,
+                failure_fingerprint(&format!("failure-{index}")),
+                true,
+                false,
+            );
+            assert_eq!(guards.all_error_tool_round_count(), index + 1);
+            if index == 7 {
+                assert!(matches!(action, crate::turn::TurnGuardAction::Finalize(_)));
+                break;
+            }
+            guards.after_tool_round_with_preserve(None, None, true, metadata_only_round(&calls, &failed_snapshot));
+            assert_eq!(guards.all_error_tool_round_count(), index + 1);
+        }
+    }
+
     fn failure_fingerprint(command: &str) -> Option<ToolCallFailureFingerprint> {
         tool_call_failure_fingerprint(&[ContentBlock::ToolUse {
             id: format!("call-{command}"),

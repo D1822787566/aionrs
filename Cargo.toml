@@ -65,6 +65,9 @@ anyhow    = "1"
 # File globbing
 glob = "0.3"
 
+# Parallel recursive filesystem walking with .gitignore support
+ignore = "0.4"
+
 # Executable lookup for cross-platform shell detection
 which = "8"
 

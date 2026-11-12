@@ -58,6 +58,14 @@ pub trait Tool: Send + Sync {
         validate_tool_input(&self.input_schema(), input)
     }
 
+    /// Include host failures without presenting them as malformed model arguments.
+    fn preflight(&self, input: &Value) -> Result<(), ToolResult> {
+        self.validate_input(input).map_err(|errors| ToolResult {
+            content: crate::validation::format_tool_input_error(self.name(), &errors),
+            is_error: true,
+        })
+    }
+
     /// Whether this tool is safe to run concurrently
     fn is_concurrency_safe(&self, input: &Value) -> bool;
 
@@ -99,6 +107,19 @@ pub trait Tool: Send + Sync {
     /// The agent-level output limit may impose a smaller bound.
     fn max_result_size(&self) -> usize {
         50_000
+    }
+
+    /// Minimum budget required to deliver a meaningful structured result.
+    /// The orchestrator checks this before executing any calls in the batch.
+    fn minimum_result_size(&self) -> usize {
+        0
+    }
+
+    /// Opt into budget-aware structured output instead of text compaction.
+    /// Called again at final delivery for validation and approval errors; must
+    /// be idempotent and must never re-execute the underlying operation.
+    fn format_result(&self, _input: &Value, _result: &ToolResult, _max_bytes: usize) -> Option<ToolResult> {
+        None
     }
 
     /// MCP server and original tool identity, used for scoped runtime recovery.
