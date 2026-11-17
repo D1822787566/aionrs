@@ -14,6 +14,7 @@ publish = false
 
 ### BEGIN HAKARI SECTION
 [dependencies]
+aho-corasick = { version = "1" }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 either = { version = "1", default-features = false, features = ["use_std"] }
 futures-channel = { version = "0.3", features = ["sink"] }
@@ -27,7 +28,7 @@ hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "ht
 memchr = { version = "2" }
 num-traits = { version = "0.2", default-features = false, features = ["i128", "std"] }
 percent-encoding = { version = "2" }
-regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "std", "unicode"] }
+regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa", "perf", "std", "unicode"] }
 regex-syntax = { version = "0.8" }
 serde_core = { version = "1", default-features = false, features = ["alloc", "result", "std"] }
 slab = { version = "0.4" }
@@ -42,11 +43,12 @@ uuid = { version = "1", features = ["v7"] }
 winnow = { version = "1" }
 
 [build-dependencies]
+aho-corasick = { version = "1" }
 hashbrown = { version = "0.16" }
 memchr = { version = "2" }
 proc-macro2 = { version = "1" }
 quote = { version = "1" }
-regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "std", "unicode"] }
+regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa", "perf", "std", "unicode"] }
 regex-syntax = { version = "0.8" }
 serde_core = { version = "1", default-features = false, features = ["alloc", "result", "std"] }
 syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", features = ["extra-traits", "full", "visit-mut"] }
