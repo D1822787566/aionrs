@@ -1,4 +1,20 @@
 use super::*;
+use std::sync::Arc;
+
+#[test]
+fn shared_replacement_refreshes_schema_without_removing_other_tools() {
+    let mut registry = ToolRegistry::new();
+    let read: Arc<dyn crate::Tool> = Arc::new(crate::read::ReadTool::new(None));
+    registry.replace_shared(read.clone());
+    registry.register(Box::new(crate::view_image::ViewImageTool::new()));
+    registry.mark_deferred_loaded(["Read", "ViewImage"]);
+    registry.replace_shared(read);
+    assert_eq!(registry.tool_names().iter().filter(|name| *name == "Read").count(), 1);
+    assert!(registry.get("ViewImage").is_some());
+    registry.remove("ViewImage");
+    assert!(registry.get("ViewImage").is_none());
+    assert!(registry.get("Read").is_some());
+}
 
 #[cfg(test)]
 mod tests {

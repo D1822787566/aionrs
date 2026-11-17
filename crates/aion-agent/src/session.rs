@@ -73,6 +73,9 @@ pub struct Session {
     pub messages: Vec<Message>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compaction_audit: Vec<CompactionAuditRecord>,
+    /// Host-owned metadata, never reconstructed from model-visible message text.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub host_context: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,6 +136,7 @@ impl SessionManager {
             context_state: ContextState::default(),
             messages: Vec::new(),
             compaction_audit: Vec::new(),
+            host_context: HashMap::new(),
         };
         self.with_session_lock(&session.id, || {
             if self.session_exists(&session.id)? {

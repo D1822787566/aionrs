@@ -36,7 +36,7 @@ use crate::plan::tools::{EnterPlanModeTool, ExitPlanModeTool};
 use crate::session::Session;
 use crate::skill_tool::SkillTool;
 use crate::spawn_tool::SpawnTool;
-use crate::spawner::AgentSpawner;
+use crate::spawner::{AgentSpawner, HostTools};
 use crate::tool_policy::ToolPolicy;
 
 /// Result of bootstrapping an agent engine with all features initialized.
@@ -78,6 +78,7 @@ pub struct AgentBootstrap {
     runtime_env: Vec<(String, String)>,
     operation_contract: Option<OperationContract>,
     tool_policy: ToolPolicy,
+    host_tools: HostTools,
 }
 
 struct BootstrapEnvironment {
@@ -118,6 +119,7 @@ impl AgentBootstrap {
             runtime_env: Vec::new(),
             operation_contract: None,
             tool_policy: ToolPolicy::default(),
+            host_tools: Default::default(),
         }
     }
 
@@ -148,6 +150,12 @@ impl AgentBootstrap {
     /// Restrict which registered tools can be advertised and executed.
     pub fn tool_policy(mut self, tool_policy: ToolPolicy) -> Self {
         self.tool_policy = tool_policy;
+        self
+    }
+
+    /// Host tools are shared with children and may change between turns.
+    pub fn host_tools(mut self, tools: HostTools) -> Self {
+        self.host_tools = tools;
         self
     }
 
@@ -417,7 +425,7 @@ impl AgentBootstrap {
             workspace.to_path_buf(),
             self.runtime_env.clone(),
             self.tool_policy.clone(),
-        ).with_operation_contract(self.operation_contract.clone());
+        ).with_operation_contract(self.operation_contract.clone()).with_host_tools(self.host_tools.clone());
         registry.register(Box::new(SpawnTool::new(Arc::new(spawner))));
     }
 

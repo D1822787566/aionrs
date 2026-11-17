@@ -73,7 +73,11 @@ impl Tool for McpToolProxy {
     }
 
     async fn execute(&self, input: Value) -> ToolResult {
-        match self.manager.call_tool(&self.server_name, &self.tool_name, input).await {
+        match self
+            .manager
+            .call_tool_cancellable(&self.server_name, &self.tool_name, input)
+            .await
+        {
             Ok(content) => ToolResult {
                 content,
                 is_error: false,

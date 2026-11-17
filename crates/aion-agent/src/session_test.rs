@@ -579,6 +579,7 @@ mod tests {
                 }],
             )],
             compaction_audit: Vec::new(),
+            host_context: Default::default(),
         }
     }
 

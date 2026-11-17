@@ -47,6 +47,7 @@ use aion_protocol::events::{OutputType, ProtocolEvent, ToolCategory, ToolStatus}
 use aion_protocol::writer::ProtocolEmitter;
 use aion_providers::provider::{LlmProvider, create_provider};
 use aion_tools::registry::ToolRegistry;
+use aion_tools::tool_search::ToolSearchTool;
 use aion_types::llm::{LlmEvent, LlmRequest, ThinkingConfig};
 use aion_types::message::{ContentBlock, ImageInputCapability, Message, Role, StopReason, TokenUsage};
 use aion_types::skill_types::{ContextModifier, PlanModeTransition, effort_to_string};
@@ -383,6 +384,22 @@ impl AgentEngine {
 
     pub fn registry_mut(&mut self) -> &mut ToolRegistry {
         &mut self.tools
+    }
+
+    /// Refresh derived tool metadata after a host replaces live tool contracts.
+    pub fn refresh_tools(&mut self) {
+        let definitions = self
+            .tools
+            .to_tool_defs_filtered(|tool| self.tool_policy.allows(tool.name()));
+        self.tools.replace_shared(Arc::new(ToolSearchTool::new(definitions)));
+        self.refresh_local_context_estimate();
+    }
+
+    pub fn set_host_context(&mut self, key: &str, value: serde_json::Value) {
+        if let Some(session) = &mut self.current_session {
+            session.host_context.insert(key.to_owned(), value);
+        }
+        self.save_session();
     }
 
     /// Replace the runtime authorization policy for registered tools.

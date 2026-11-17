@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -33,6 +34,38 @@ pub struct McpManager {
     servers: HashMap<String, McpServer>,
     /// Monotonically increasing request ID counter for all JSON-RPC calls
     next_id: AtomicU64,
+}
+
+struct PendingToolCall {
+    manager: Arc<McpManager>,
+    server: String,
+    id: u64,
+    armed: bool,
+}
+
+impl Drop for PendingToolCall {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let manager = self.manager.clone();
+        let server_name = self.server.clone();
+        let id = self.id;
+        runtime.spawn(async move {
+            if let Some(server) = manager.servers.get(&server_name) {
+                let request = JsonRpcRequest::notification(
+                    "notifications/cancelled",
+                    Some(json!({
+                        "requestId": id, "reason": "Caller cancelled the tool execution"
+                    })),
+                );
+                let _ = tokio::time::timeout(Duration::from_secs(2), server.transport.notify(&request)).await;
+            }
+        });
+    }
 }
 
 impl McpManager {
@@ -259,13 +292,48 @@ impl McpManager {
         tool_name: &str,
         arguments: serde_json::Value,
     ) -> Result<String, McpError> {
+        self.call_tool_request(
+            server_name,
+            tool_name,
+            arguments,
+            self.next_id.fetch_add(1, Ordering::Relaxed),
+        )
+        .await
+    }
+
+    /// Dropping this future cancels the corresponding remote MCP request.
+    pub async fn call_tool_cancellable(
+        self: &Arc<Self>,
+        server_name: &str,
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<String, McpError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let mut pending = PendingToolCall {
+            manager: self.clone(),
+            server: server_name.into(),
+            id,
+            armed: true,
+        };
+        let result = self.call_tool_request(server_name, tool_name, arguments, id).await;
+        pending.armed = false;
+        result
+    }
+
+    async fn call_tool_request(
+        &self,
+        server_name: &str,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        id: u64,
+    ) -> Result<String, McpError> {
         let server = self
             .servers
             .get(server_name)
             .ok_or_else(|| McpError::ServerNotFound(server_name.to_string()))?;
 
         let request = JsonRpcRequest::new(
-            0, // id doesn't matter for stdio, will be used for SSE/HTTP
+            id,
             "tools/call",
             Some(json!({
                 "name": tool_name,
@@ -296,7 +364,11 @@ impl McpManager {
             }
         }
 
-        Ok(text_parts.join("\n"))
+        let text = text_parts.join("\n");
+        if tool_result.is_error {
+            return Err(McpError::ToolExecution(text));
+        }
+        Ok(text)
     }
 
     /// Get names of all connected servers.

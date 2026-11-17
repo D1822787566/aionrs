@@ -1,6 +1,7 @@
 use aion_tools::aion_operation_contract::OperationContract;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::RwLock;
 
 use async_trait::async_trait;
 
@@ -24,6 +25,9 @@ use crate::tool_policy::ToolPolicy;
 // Re-export from aion-types — single source of truth
 pub use aion_types::spawner::{ForkOverrides, Spawner, SubAgentConfig, SubAgentResult};
 
+/// Runtime tools supplied by an embedding host, with the same scope in children.
+pub type HostTools = Arc<RwLock<Vec<Arc<dyn aion_tools::Tool>>>>;
+
 /// Spawns independent child agents that share the parent's LLM provider.
 ///
 /// Sub-agents use a [`NullSink`] so their streaming output is silently
@@ -40,6 +44,7 @@ pub struct AgentSpawner {
     runtime_env: Vec<(String, String)>,
     operation_contract: Option<OperationContract>,
     tool_policy: ToolPolicy,
+    host_tools: HostTools,
 }
 
 impl AgentSpawner {
@@ -61,11 +66,17 @@ impl AgentSpawner {
             runtime_env,
             operation_contract: None,
             tool_policy,
+            host_tools: Default::default(),
         }
     }
 
     pub fn with_operation_contract(mut self, contract: Option<OperationContract>) -> Self {
         self.operation_contract = contract;
+        self
+    }
+
+    pub fn with_host_tools(mut self, tools: HostTools) -> Self {
+        self.host_tools = tools;
         self
     }
 
@@ -83,12 +94,13 @@ impl AgentSpawner {
         tracing::info!(target: "aion_agent", cwd = %self.cwd.display(), "sub-agent spawned with workspace cwd");
 
         let child_policy = effective_child_tool_policy(&self.tool_policy, &[]);
-        let tools = build_tool_registry_with_contract(
+        let mut tools = build_tool_registry_with_contract(
             &child_policy,
             &self.cwd,
             &self.runtime_env,
             self.operation_contract.clone(),
         );
+        install_host_tools(&mut tools, &self.host_tools, &child_policy);
         let output: Arc<dyn OutputSink> = Arc::new(NullSink);
         let mut engine = AgentEngine::new_with_provider_and_env(
             self.provider.clone(),
@@ -152,6 +164,7 @@ impl AgentSpawner {
             runtime_env: self.runtime_env.clone(),
             operation_contract: self.operation_contract.clone(),
             tool_policy: self.tool_policy.clone(),
+            host_tools: self.host_tools.clone(),
         }
     }
 }
@@ -172,12 +185,13 @@ impl Spawner for AgentSpawner {
         }
 
         let child_policy = effective_child_tool_policy(&self.tool_policy, &overrides.allowed_tools);
-        let tools = build_tool_registry_with_contract(
+        let mut tools = build_tool_registry_with_contract(
             &child_policy,
             &self.cwd,
             &self.runtime_env,
             self.operation_contract.clone(),
         );
+        install_host_tools(&mut tools, &self.host_tools, &child_policy);
         let output: Arc<dyn OutputSink> = Arc::new(NullSink);
         let mut engine = AgentEngine::new_with_provider_and_env(
             self.provider.clone(),
@@ -205,6 +219,14 @@ impl Spawner for AgentSpawner {
                 turns: 0,
                 is_error: true,
             },
+        }
+    }
+}
+
+fn install_host_tools(tools: &mut ToolRegistry, host_tools: &HostTools, policy: &ToolPolicy) {
+    for tool in host_tools.read().unwrap_or_else(|e| e.into_inner()).iter() {
+        if policy.allows(tool.name()) {
+            tools.replace_shared(tool.clone());
         }
     }
 }

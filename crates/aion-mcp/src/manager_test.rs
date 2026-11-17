@@ -78,6 +78,89 @@ mod tests {
         McpManager::new_for_test(entries)
     }
 
+    #[tokio::test]
+    async fn tool_error_flag_is_not_reported_as_successful_text() {
+        let manager = make_manager_with_servers(vec![(
+            "vision",
+            false,
+            Box::new(MockTransport::new(vec![
+                json!({"content":[{"type":"text","text":"image_upload_failed"}],"isError":true}),
+                json!({"content":[{"type":"text","text":"answer"}],"isError":false}),
+            ])),
+        )]);
+        assert!(matches!(
+            manager.call_tool("vision", "look_at_image", json!({})).await,
+            Err(McpError::ToolExecution(text)) if text == "image_upload_failed"
+        ));
+        assert_eq!(
+            manager.call_tool("vision", "look_at_image", json!({})).await.unwrap(),
+            "answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_calls_notify_the_remote_with_unique_request_ids() {
+        struct PendingTransport {
+            started: Arc<tokio::sync::Notify>,
+            cancelled: Arc<tokio::sync::Notify>,
+            requests: Arc<Mutex<Vec<u64>>>,
+            cancellations: Arc<Mutex<Vec<u64>>>,
+        }
+        #[async_trait]
+        impl McpTransport for PendingTransport {
+            async fn request(&self, request: &JsonRpcRequest) -> Result<JsonRpcResponse, McpError> {
+                self.requests.lock().unwrap().push(request.id.unwrap());
+                self.started.notify_one();
+                std::future::pending().await
+            }
+            async fn notify(&self, request: &JsonRpcRequest) -> Result<(), McpError> {
+                assert_eq!(request.method, "notifications/cancelled");
+                self.cancellations
+                    .lock()
+                    .unwrap()
+                    .push(request.params.as_ref().unwrap()["requestId"].as_u64().unwrap());
+                self.cancelled.notify_one();
+                Ok(())
+            }
+            async fn close(&self) -> Result<(), McpError> {
+                Ok(())
+            }
+        }
+        let started = Arc::new(tokio::sync::Notify::new());
+        let cancelled = Arc::new(tokio::sync::Notify::new());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let cancellations = Arc::new(Mutex::new(Vec::new()));
+        let manager = Arc::new(make_manager_with_servers(vec![(
+            "vision",
+            false,
+            Box::new(PendingTransport {
+                started: started.clone(),
+                cancelled: cancelled.clone(),
+                requests: requests.clone(),
+                cancellations: cancellations.clone(),
+            }),
+        )]));
+        for _ in 0..2 {
+            let manager = manager.clone();
+            let task = tokio::spawn(async move {
+                manager
+                    .call_tool_cancellable("vision", "look_at_image", json!({}))
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(1), started.notified())
+                .await
+                .unwrap();
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            tokio::time::timeout(Duration::from_secs(1), cancelled.notified())
+                .await
+                .unwrap();
+        }
+        let ids = requests.lock().unwrap().clone();
+        assert_eq!(ids, *cancellations.lock().unwrap());
+        assert_ne!(ids[0], ids[1]);
+    }
+
     fn delayed_config(delay_ms: u64, startup_timeout_ms: Option<u64>) -> McpServerConfig {
         McpServerConfig {
             transport: TransportType::Stdio,

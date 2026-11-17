@@ -33,6 +33,9 @@ pub enum McpError {
     #[error("Tool not found: {server}/{tool}")]
     ToolNotFound { server: String, tool: String },
 
+    #[error("Tool execution failed: {0}")]
+    ToolExecution(String),
+
     #[error("Initialization failed: {0}")]
     InitFailed(String),
 

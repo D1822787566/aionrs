@@ -1,11 +1,12 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use aion_types::tool::ToolDef;
 
 use crate::Tool;
 
 pub struct ToolRegistry {
-    tools: Vec<Box<dyn Tool>>,
+    tools: Vec<Arc<dyn Tool>>,
     loaded_deferred: HashSet<String>,
 }
 
@@ -23,7 +24,18 @@ impl ToolRegistry {
     }
 
     pub fn register(&mut self, tool: Box<dyn Tool>) {
+        self.tools.push(Arc::from(tool));
+    }
+
+    /// Replace a host-owned tool without losing other tools or deferred state.
+    pub fn replace_shared(&mut self, tool: Arc<dyn Tool>) {
+        self.remove(tool.name());
         self.tools.push(tool);
+    }
+
+    pub fn remove(&mut self, name: &str) {
+        self.tools.retain(|tool| tool.name() != name);
+        self.loaded_deferred.remove(name);
     }
 
     /// Mark deferred tools returned by ToolSearch as available with full schemas.

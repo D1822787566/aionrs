@@ -1,4 +1,19 @@
 use super::*;
+use aion_tools::view_image::ViewImageTool;
+
+#[test]
+fn host_tools_reach_children_and_obey_child_policy() {
+    let tools: HostTools = Arc::new(RwLock::new(vec![Arc::new(ViewImageTool::new())]));
+    let mut registry = ToolRegistry::new();
+    install_host_tools(&mut registry, &tools, &ToolPolicy::allow_only(["Read"]));
+    assert!(registry.get("ViewImage").is_none());
+    install_host_tools(&mut registry, &tools, &ToolPolicy::Unrestricted);
+    assert!(registry.get("ViewImage").is_some());
+    tools.write().unwrap().clear();
+    let mut next = ToolRegistry::new();
+    install_host_tools(&mut next, &tools, &ToolPolicy::Unrestricted);
+    assert!(next.get("ViewImage").is_none());
+}
 
 #[cfg(test)]
 mod phase7_tests {

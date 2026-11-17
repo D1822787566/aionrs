@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use serde_json::{Value, json};
+use tokio::io::AsyncReadExt;
 
 use aion_protocol::events::ToolCategory;
 use aion_types::message::{ContentBlock, ImageUrl, extension_to_image_media_type};
@@ -34,7 +35,8 @@ impl ViewImageTool {
         Self
     }
 
-    async fn load_image(&self, input: &Value) -> Result<ImageUrl, String> {
+    /// Load validated bytes for a host wrapper without adding them to model history.
+    pub async fn load_image(&self, input: &Value) -> Result<ImageUrl, String> {
         let file_path = input
             .get("file_path")
             .and_then(Value::as_str)
@@ -62,7 +64,12 @@ impl ViewImageTool {
             return Err(format!("Image exceeds the {} byte size limit", MAX_IMAGE_SIZE_BYTES));
         }
 
-        let bytes = tokio::fs::read(path)
+        let file = tokio::fs::File::open(path)
+            .await
+            .map_err(|error| format!("Failed to read image: {error}"))?;
+        let mut bytes = Vec::new();
+        file.take(MAX_IMAGE_SIZE_BYTES + 1)
+            .read_to_end(&mut bytes)
             .await
             .map_err(|error| format!("Failed to read image: {error}"))?;
         if bytes.len() as u64 > MAX_IMAGE_SIZE_BYTES {

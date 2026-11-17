@@ -1053,6 +1053,7 @@ mod tests_compact {
         context_state.microcompact_count = 5;
         let session = Session {
             id: "resume-context".into(),
+            host_context: Default::default(),
             forked_from: None,
             root_id: None,
             created_at: Utc::now(),
