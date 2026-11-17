@@ -506,6 +506,7 @@ async fn tc_2_6_02_micro_before_auto_execution_order() {
         captured: capture_ref,
     });
 
+    let dir = tempdir().expect("tempdir");
     let mut config = test_config();
     config.compact = CompactConfig {
         microcompact_enabled: true,
@@ -515,6 +516,8 @@ async fn tc_2_6_02_micro_before_auto_execution_order() {
         emergency_buffer: 3_000,
         ..Default::default()
     };
+    config.session.enabled = true;
+    config.session.directory = dir.path().to_string_lossy().into_owned();
     config.max_turns = Some(20);
 
     let mut registry = ToolRegistry::new();
@@ -522,6 +525,7 @@ async fn tc_2_6_02_micro_before_auto_execution_order() {
     let output = silent_output();
 
     let mut engine = AgentEngine::new_with_provider(provider, config, registry, output, std::env::temp_dir());
+    engine.init_session("test", "/tmp", None).expect("init session");
     let result = engine.run("Start", "msg-1").await.expect("should succeed");
 
     assert_eq!(result.text, "Done after compact");
