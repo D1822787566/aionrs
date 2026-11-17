@@ -812,6 +812,22 @@ mod tests_compact {
         make_compact_engine_with_output(compact_config, compact_state, messages, Arc::new(NullOutput))
     }
 
+    fn make_persisted_compact_engine(
+        compact_config: CompactConfig,
+        compact_state: CompactState,
+        messages: Vec<Message>,
+    ) -> (super::AgentEngine, tempfile::TempDir) {
+        let directory = tempdir().unwrap();
+        let manager = SessionManager::new(directory.path().to_path_buf(), 10);
+        let session = manager
+            .create("anthropic", "test-model", "/tmp", Some("compact-test"))
+            .unwrap();
+        let mut engine = make_compact_engine(compact_config, compact_state, messages);
+        engine.session_manager = Some(manager);
+        engine.current_session = Some(session);
+        (engine, directory)
+    }
+
     fn make_compact_engine_with_output(
         compact_config: CompactConfig,
         compact_state: CompactState,
@@ -1345,7 +1361,7 @@ mod tests_compact {
         };
         let state = CompactState::new();
 
-        let mut engine = make_compact_engine(config, state, messages);
+        let (mut engine, _directory) = make_persisted_compact_engine(config, state, messages);
         engine.context_state.replace_with_provider_usage(1_000);
         engine.sync_compact_watermark();
         engine.run_compaction().await.unwrap();
@@ -1386,7 +1402,7 @@ mod tests_compact {
         state.last_input_tokens = 198_000;
         state.consecutive_failures = 3;
 
-        let mut engine = make_compact_engine(config, state, messages);
+        let (mut engine, _directory) = make_persisted_compact_engine(config, state, messages);
         engine.context_state.replace_with_provider_usage(198_000);
         engine.sync_compact_watermark();
 
@@ -1432,7 +1448,7 @@ mod tests_compact {
             Message::new(Role::Assistant, vec![ContentBlock::Text { text: "second".into() }]),
             Message::new(Role::User, vec![ContentBlock::Text { text: "third".into() }]),
         ];
-        let mut engine = make_compact_engine(config, state, messages);
+        let (mut engine, _directory) = make_persisted_compact_engine(config, state, messages);
         engine.provider = Arc::new(SuccessfulProvider {
             usage: TokenUsage::default(),
         });
