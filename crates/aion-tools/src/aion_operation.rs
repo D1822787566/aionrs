@@ -125,6 +125,10 @@ pub const OPERATION_PATHS: &[&str] = &[
     "skills.list",
     "skills.show",
     "skills.cat",
+    "file.prepare",
+    "file.inspect",
+    "file.xls.write",
+    "file.finish",
 ];
 
 /// An AionUi operation that is safe to advertise only when the host injected
@@ -163,6 +167,8 @@ impl AionOperationTool {
         matches!(
             action,
             "create"
+                | "prepare"
+                | "finish"
                 | "update"
                 | "delete"
                 | "import"

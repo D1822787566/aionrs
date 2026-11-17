@@ -44,6 +44,14 @@ async fn state_changes_require_explicit_confirmation() {
         .await;
     assert!(result.is_error);
     assert!(result.content.contains("aion_operation_confirmation_required"));
+    for operation in ["file.prepare", "file.xls.write", "file.finish"] {
+        let result = tool.execute(json!({"operation":operation,"input":{}})).await;
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("aion_operation_confirmation_required"),
+            "{operation}"
+        );
+    }
 }
 
 #[tokio::test]
