@@ -37,6 +37,7 @@ use crate::session::Session;
 use crate::skill_tool::SkillTool;
 use crate::spawn_tool::SpawnTool;
 use crate::spawner::{AgentSpawner, HostTools};
+use crate::subagent_output::SubagentTasks;
 use crate::tool_policy::ToolPolicy;
 
 /// Result of bootstrapping an agent engine with all features initialized.
@@ -71,6 +72,7 @@ pub struct AgentBootstrap {
 
     // Output integration.
     output: Arc<dyn OutputSink>,
+    subagent_tasks: Arc<SubagentTasks>,
 
     // Optional externally supplied runtime state.
     provider: Option<Arc<dyn LlmProvider>>,
@@ -114,6 +116,7 @@ impl AgentBootstrap {
             isolate_skill_dirs: false,
             host_skills: None,
             output,
+            subagent_tasks: Default::default(),
             provider: None,
             resume_session: None,
             runtime_env: Vec::new(),
@@ -425,7 +428,8 @@ impl AgentBootstrap {
             workspace.to_path_buf(),
             self.runtime_env.clone(),
             self.tool_policy.clone(),
-        ).with_operation_contract(self.operation_contract.clone()).with_host_tools(self.host_tools.clone());
+        ).with_operation_contract(self.operation_contract.clone()).with_host_tools(self.host_tools.clone())
+            .with_observer(self.output.clone(), self.subagent_tasks.clone());
         registry.register(Box::new(SpawnTool::new(Arc::new(spawner))));
     }
 
@@ -470,6 +474,7 @@ impl AgentBootstrap {
         engine.set_plan_active_flag(plan_active_flag);
         engine.set_tool_policy(self.tool_policy);
         engine.set_prompt_usage(prompt_usage);
+        engine.set_subagent_tasks(self.subagent_tasks);
         engine
     }
 }

@@ -31,4 +31,7 @@ pub trait OutputSink: Send + Sync {
 
     /// Display informational message
     fn emit_info(&self, msg: &str);
+
+    /// Independent observation channel; children never write to the parent stream.
+    fn emit_subagent(&self, _event: aion_types::subagent::SubagentEvent) {}
 }

@@ -24,6 +24,7 @@ use crate::plan::prompt::plan_mode_instructions;
 use crate::plan::state::PlanState;
 use crate::session::{CompactionAuditKind, CompactionAuditRecord, Session, SessionManager};
 use crate::stream::StreamOutcome;
+use crate::subagent_output::SubagentTasks;
 #[cfg(test)]
 use crate::tool_call::merge_tool_results;
 use crate::tool_call::{
@@ -134,6 +135,7 @@ pub struct AgentEngine {
     // Output and host protocol integration.
     /// Sink for user-visible and host-visible output events.
     output: Arc<dyn OutputSink>,
+    subagent_tasks: Option<Arc<SubagentTasks>>,
     /// Optional host approval manager for JSON stream tool approvals.
     approval_manager: Option<Arc<ToolApprovalManager>>,
     /// Optional protocol emitter used to send structured host events.
@@ -169,6 +171,17 @@ pub struct AgentEngine {
 }
 
 impl AgentEngine {
+    pub(crate) fn set_subagent_tasks(&mut self, tasks: Arc<SubagentTasks>) {
+        self.subagent_tasks = Some(tasks);
+    }
+
+    /// Wait after dropping an interrupted run so child engines and tools are released.
+    pub async fn drain_subagents(&self) {
+        if let Some(tasks) = &self.subagent_tasks {
+            tasks.drain().await;
+        }
+    }
+
     pub fn new(config: Config, tools: ToolRegistry, output: Arc<dyn OutputSink>, cwd: PathBuf) -> Self {
         let provider = create_provider(&config);
         Self::new_with_provider(provider, config, tools, output, cwd)
@@ -238,6 +251,7 @@ impl AgentEngine {
             session_manager,
             current_session: None,
             output,
+            subagent_tasks: None,
             approval_manager: None,
             protocol_writer: None,
             compact_config,
@@ -337,6 +351,7 @@ impl AgentEngine {
             session_manager,
             current_session: Some(session),
             output,
+            subagent_tasks: None,
             approval_manager: None,
             protocol_writer: None,
             compact_config,

@@ -20,6 +20,7 @@ pub mod skill_tool;
 pub mod spawn_tool;
 pub mod spawner;
 mod stream;
+mod subagent_output;
 mod tool_call;
 pub mod tool_policy;
 mod tool_recovery;

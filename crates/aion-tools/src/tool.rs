@@ -81,6 +81,11 @@ pub trait Tool: Send + Sync {
         self.execute(input).await.into()
     }
 
+    /// Execute with the actual provider tool-call identity, outside model input.
+    async fn execute_with_context(&self, input: Value, _call_id: &str) -> ToolExecutionOutput {
+        self.execute_with_follow_up(input).await
+    }
+
     /// Whether advertising and executing this tool requires image-input
     /// support from the currently selected model.
     fn requires_image_input(&self) -> bool {

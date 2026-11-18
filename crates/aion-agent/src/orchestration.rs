@@ -270,7 +270,7 @@ async fn execute_single(
     let (result, modifier, follow_up_blocks) = match registry.get(name) {
         Some(tool) => {
             let max_size = tool.max_result_size();
-            let mut execution = tool.execute_with_follow_up(input.clone()).await;
+            let mut execution = tool.execute_with_context(input.clone(), id).await;
             {
                 let mut remaining = skill_context_budget.lock().unwrap_or_else(|e| e.into_inner());
                 reserve_skill_context(&mut execution, &mut remaining);

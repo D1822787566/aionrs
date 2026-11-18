@@ -7,4 +7,5 @@ pub mod llm;
 pub mod message;
 pub mod skill_types;
 pub mod spawner;
+pub mod subagent;
 pub mod tool;

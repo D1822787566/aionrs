@@ -84,6 +84,7 @@ mod tests_set_config {
             plan_active_flag: None,
             cache_detector: super::CacheBreakDetector::new(),
             commands: crate::commands::default_registry(),
+            subagent_tasks: None,
         }
     }
 
@@ -567,6 +568,7 @@ mod tests_phase6 {
             plan_active_flag: None,
             cache_detector: super::CacheBreakDetector::new(),
             commands: crate::commands::default_registry(),
+            subagent_tasks: None,
         }
     }
 
@@ -871,6 +873,7 @@ mod tests_compact {
             plan_active_flag: None,
             cache_detector: super::CacheBreakDetector::new(),
             commands: crate::commands::default_registry(),
+            subagent_tasks: None,
         }
     }
 
@@ -1681,6 +1684,7 @@ mod tests_plan_mode {
             plan_active_flag: Some(flag),
             cache_detector: super::CacheBreakDetector::new(),
             commands: crate::commands::default_registry(),
+            subagent_tasks: None,
         }
     }
 
@@ -1904,6 +1908,7 @@ mod tests_handle_command {
             plan_active_flag: None,
             cache_detector: CacheBreakDetector::new(),
             commands: default_registry(),
+            subagent_tasks: None,
         }
     }
 
@@ -2933,6 +2938,7 @@ mod tests_tool_policy_enforcement {
             plan_active_flag: None,
             cache_detector: CacheBreakDetector::new(),
             commands: default_registry(),
+            subagent_tasks: None,
         }
     }
 

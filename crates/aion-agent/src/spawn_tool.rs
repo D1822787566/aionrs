@@ -8,6 +8,7 @@ use aion_protocol::events::ToolCategory;
 use aion_types::tool::{JsonSchema, ToolResult};
 
 use aion_tools::Tool;
+use aion_tools::ToolExecutionOutput;
 
 const DEFAULT_SUB_AGENT_MAX_TURNS: usize = 200;
 const DEFAULT_SUB_AGENT_MAX_TOKENS: u32 = 4096;
@@ -21,58 +22,8 @@ impl SpawnTool {
     pub fn new(spawner: Arc<AgentSpawner>) -> Self {
         Self { spawner }
     }
-}
 
-#[async_trait]
-impl Tool for SpawnTool {
-    fn name(&self) -> &str {
-        "Spawn"
-    }
-
-    fn description(&self) -> &str {
-        "Spawn one or more sub-agents to handle tasks in parallel. \
-         Each sub-agent has its own conversation context and tool access.\n\n\
-         - Maximum 5 sub-agents per call.\n\
-         - Each sub-agent runs up to 200 model turns with a 4096 token output limit.\n\
-         - Use for independent, parallelizable tasks (e.g., searching different modules, \
-         running separate analyses).\n\
-         - Do NOT use for tasks that need shared state or sequential coordination."
-    }
-
-    fn input_schema(&self) -> JsonSchema {
-        json!({
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "tasks": {
-                    "type": "array",
-                    "description": "List of tasks for sub-agents to execute in parallel",
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "properties": {
-                            "name": {
-                                "type": "string",
-                                "description": "Short descriptive name for the task"
-                            },
-                            "prompt": {
-                                "type": "string",
-                                "description": "The task description / prompt for the sub-agent"
-                            }
-                        },
-                        "required": ["name", "prompt"]
-                    }
-                }
-            },
-            "required": ["tasks"]
-        })
-    }
-
-    fn is_concurrency_safe(&self, _input: &Value) -> bool {
-        false // manages its own concurrency
-    }
-
-    async fn execute(&self, input: Value) -> ToolResult {
+    async fn run(&self, input: Value, call_id: &str) -> ToolResult {
         let tasks = match parse_tasks(&input) {
             Ok(tasks) => tasks,
             Err(e) => {
@@ -97,7 +48,7 @@ impl Tool for SpawnTool {
             };
         }
 
-        let results = self.spawner.spawn_parallel(tasks).await;
+        let results = self.spawner.spawn_parallel_for_call(tasks, call_id).await;
 
         let output: Vec<String> = results
             .iter()
@@ -116,6 +67,56 @@ impl Tool for SpawnTool {
             content: output.join("\n\n---\n\n"),
             is_error: all_error,
         }
+    }
+}
+
+#[async_trait]
+impl Tool for SpawnTool {
+    fn name(&self) -> &str {
+        "Spawn"
+    }
+
+    fn description(&self) -> &str {
+        "Spawn one or more sub-agents to handle tasks in parallel. \
+         Each sub-agent has its own conversation context and tool access.\n\n\
+         - Maximum 5 sub-agents per call.\n\
+         - Each sub-agent runs up to 200 model turns with a 4096 token output limit.\n\
+         - Use for independent, parallelizable tasks (e.g., searching different modules, \
+         running separate analyses).\n\
+         - Do NOT use for tasks that need shared state or sequential coordination."
+    }
+
+    fn input_schema(&self) -> JsonSchema {
+        json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {
+                "tasks": {
+                    "type": "array",
+                    "description": "List of tasks for sub-agents to execute in parallel",
+                    "items": {
+                        "type": "object", "additionalProperties": false,
+                        "properties": {
+                            "name": {"type": "string", "description": "Short descriptive name for the task"},
+                            "prompt": {"type": "string", "description": "The task description / prompt for the sub-agent"}
+                        },
+                        "required": ["name", "prompt"]
+                    }
+                }
+            },
+            "required": ["tasks"]
+        })
+    }
+
+    fn is_concurrency_safe(&self, _input: &Value) -> bool {
+        false
+    }
+
+    async fn execute(&self, input: Value) -> ToolResult {
+        self.run(input, "").await
+    }
+
+    async fn execute_with_context(&self, input: Value, call_id: &str) -> ToolExecutionOutput {
+        self.run(input, call_id).await.into()
     }
 
     fn category(&self) -> ToolCategory {

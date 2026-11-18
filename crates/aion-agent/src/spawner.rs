@@ -15,11 +15,16 @@ use aion_tools::grep::GrepTool;
 use aion_tools::read::ReadTool;
 use aion_tools::registry::ToolRegistry;
 use aion_tools::write::WriteTool;
-use aion_types::message::TokenUsage;
+use aion_types::message::{StopReason, TokenUsage};
+use aion_types::subagent::{SubagentIdentity, SubagentStatus};
+use chrono::Utc;
+use tokio::task::JoinSet;
+use uuid::Uuid;
 
 use crate::engine::AgentEngine;
 use crate::output::OutputSink;
 use crate::output::null_sink::NullSink;
+use crate::subagent_output::{ChildExecution, SubagentTasks};
 use crate::tool_policy::ToolPolicy;
 
 // Re-export from aion-types — single source of truth
@@ -30,10 +35,8 @@ pub type HostTools = Arc<RwLock<Vec<Arc<dyn aion_tools::Tool>>>>;
 
 /// Spawns independent child agents that share the parent's LLM provider.
 ///
-/// Sub-agents use a [`NullSink`] so their streaming output is silently
-/// discarded.  Results are collected via `engine.run()` and returned to the
-/// parent which emits them as a single `tool_result` event — matching the
-/// Claude Code pattern where only the parent writes to stdout.
+/// Results remain one parent tool result. An optional identity-scoped sink
+/// observes child execution without writing child text into the parent stream.
 ///
 /// Children inherit the parent's runtime tool policy. Fork overrides can
 /// further narrow that policy, but cannot restore tools denied to the parent.
@@ -45,6 +48,8 @@ pub struct AgentSpawner {
     operation_contract: Option<OperationContract>,
     tool_policy: ToolPolicy,
     host_tools: HostTools,
+    output: Option<Arc<dyn OutputSink>>,
+    tasks: Arc<SubagentTasks>,
 }
 
 impl AgentSpawner {
@@ -67,6 +72,8 @@ impl AgentSpawner {
             operation_contract: None,
             tool_policy,
             host_tools: Default::default(),
+            output: None,
+            tasks: Default::default(),
         }
     }
 
@@ -80,8 +87,22 @@ impl AgentSpawner {
         self
     }
 
+    pub(crate) fn with_observer(mut self, output: Arc<dyn OutputSink>, tasks: Arc<SubagentTasks>) -> Self {
+        self.output = Some(output);
+        self.tasks = tasks;
+        self
+    }
+
     /// Spawn a single sub-agent and wait for result.
     pub async fn spawn_one(&self, sub_config: SubAgentConfig) -> SubAgentResult {
+        self.spawn_observed(sub_config, None).await
+    }
+
+    async fn spawn_observed(
+        &self,
+        sub_config: SubAgentConfig,
+        mut execution: Option<ChildExecution>,
+    ) -> SubAgentResult {
         let mut config = self.base_config.clone();
         config.max_turns = Some(sub_config.max_turns);
         config.max_tokens = Some(sub_config.max_tokens);
@@ -101,7 +122,10 @@ impl AgentSpawner {
             self.operation_contract.clone(),
         );
         install_host_tools(&mut tools, &self.host_tools, &child_policy);
-        let output: Arc<dyn OutputSink> = Arc::new(NullSink);
+        let output: Arc<dyn OutputSink> = execution
+            .as_ref()
+            .map(|execution| execution.output.clone() as Arc<dyn OutputSink>)
+            .unwrap_or_else(|| Arc::new(NullSink));
         let mut engine = AgentEngine::new_with_provider_and_env(
             self.provider.clone(),
             config,
@@ -112,48 +136,108 @@ impl AgentSpawner {
         );
         engine.set_tool_policy(child_policy);
 
-        match engine.run(&sub_config.prompt, "").await {
-            Ok(result) => SubAgentResult {
-                name: sub_config.name,
-                text: result.text,
-                usage: result.usage,
-                turns: result.turns,
-                is_error: false,
-            },
-            Err(e) => SubAgentResult {
-                name: sub_config.name,
-                text: format!("Sub-agent error: {}", e),
-                usage: TokenUsage::default(),
-                turns: 0,
-                is_error: true,
-            },
+        let (result, status, observation) = match engine.run(&sub_config.prompt, "").await {
+            Ok(result) => {
+                let status = if result.stop_reason == StopReason::EndTurn {
+                    SubagentStatus::Completed
+                } else {
+                    SubagentStatus::Failed
+                };
+                let observation = if status == SubagentStatus::Completed {
+                    result.text.clone()
+                } else {
+                    format!("Stopped: {:?}\n{}", result.stop_reason, result.text)
+                };
+                (
+                    SubAgentResult {
+                        name: sub_config.name,
+                        text: result.text,
+                        usage: result.usage,
+                        turns: result.turns,
+                        is_error: false,
+                    },
+                    status,
+                    observation,
+                )
+            }
+            Err(e) => {
+                let observation = format!("Sub-agent error: {e}");
+                (
+                    SubAgentResult {
+                        name: sub_config.name,
+                        text: format!("Sub-agent error: {}", e),
+                        usage: TokenUsage::default(),
+                        turns: 0,
+                        is_error: true,
+                    },
+                    SubagentStatus::Failed,
+                    observation,
+                )
+            }
+        };
+        if let Some(execution) = &mut execution {
+            execution.finish(status, observation);
         }
+        result
     }
 
     /// Spawn multiple sub-agents in parallel.
     pub async fn spawn_parallel(&self, sub_configs: Vec<SubAgentConfig>) -> Vec<SubAgentResult> {
-        let futures: Vec<_> = sub_configs
-            .into_iter()
-            .map(|config| {
-                let spawner = self.clone_for_spawn();
-                tokio::spawn(async move { spawner.spawn_one(config).await })
-            })
-            .collect();
+        self.spawn_parallel_for_call(sub_configs, "").await
+    }
 
-        let mut results = Vec::new();
-        for future in futures {
-            match future.await {
-                Ok(result) => results.push(result),
-                Err(e) => results.push(SubAgentResult {
-                    name: "unknown".to_string(),
-                    text: format!("Task join error: {}", e),
-                    usage: TokenUsage::default(),
-                    turns: 0,
-                    is_error: true,
-                }),
+    pub(crate) async fn spawn_parallel_for_call(
+        &self,
+        sub_configs: Vec<SubAgentConfig>,
+        call_id: &str,
+    ) -> Vec<SubAgentResult> {
+        let mut pending = JoinSet::new();
+        let mut identities = std::collections::HashMap::new();
+        let mut results: Vec<Option<SubAgentResult>> = (0..sub_configs.len()).map(|_| None).collect();
+        for (index, config) in sub_configs.into_iter().enumerate() {
+            let spawner = self.clone_for_spawn();
+            let execution = self.output.as_ref().filter(|_| !call_id.is_empty()).map(|output| {
+                ChildExecution::new(
+                    SubagentIdentity {
+                        child_run_id: Uuid::now_v7().to_string(),
+                        parent_call_id: call_id.into(),
+                        task_index: index,
+                        name: config.name.clone(),
+                        prompt: config.prompt.clone(),
+                        started_at: Utc::now().timestamp_millis(),
+                    },
+                    output.clone(),
+                    self.tasks.clone(),
+                )
+            });
+            let name = config.name.clone();
+            let handle = pending.spawn(async move { spawner.spawn_observed(config, execution).await });
+            identities.insert(handle.id(), (index, name));
+        }
+        // JoinSet aborts every remaining child when the parent tool future is dropped.
+        while let Some(joined) = pending.join_next_with_id().await {
+            let (id, result) = match joined {
+                Ok((id, result)) => (id, result),
+                Err(e) => {
+                    let id = e.id();
+                    let name = identities.get(&id).map(|(_, name)| name.clone()).unwrap_or_default();
+                    (
+                        id,
+                        SubAgentResult {
+                            name,
+                            text: format!("Task join error: {}", e),
+                            usage: TokenUsage::default(),
+                            turns: 0,
+                            is_error: true,
+                        },
+                    )
+                }
+            };
+            if let Some((index, _)) = identities.remove(&id) {
+                results[index] = Some(result);
             }
         }
-        results
+        results.into_iter().flatten().collect()
     }
 
     fn clone_for_spawn(&self) -> Self {
@@ -165,6 +249,8 @@ impl AgentSpawner {
             operation_contract: self.operation_contract.clone(),
             tool_policy: self.tool_policy.clone(),
             host_tools: self.host_tools.clone(),
+            output: self.output.clone(),
+            tasks: self.tasks.clone(),
         }
     }
 }
